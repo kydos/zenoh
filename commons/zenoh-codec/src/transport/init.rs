@@ -11,9 +11,6 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{
-    common::extension, RCodec, WCodec, Zenoh080, Zenoh080Bounded, Zenoh080Header, Zenoh080Length,
-};
 use zenoh_buffers::{
     reader::{DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -21,12 +18,16 @@ use zenoh_buffers::{
 };
 use zenoh_protocol::{
     common::{iext, imsg},
-    core::{Resolution, WhatAmI, ZenohId},
+    core::{Resolution, WhatAmI, ZenohIdProto},
     transport::{
         batch_size, id,
         init::{ext, flag, InitAck, InitSyn},
         BatchSize,
     },
+};
+
+use crate::{
+    common::extension, RCodec, WCodec, Zenoh080, Zenoh080Bounded, Zenoh080Header, Zenoh080Length,
 };
 
 // InitSyn
@@ -44,11 +45,14 @@ where
             resolution,
             batch_size,
             ext_qos,
+            ext_qos_link,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_patch,
         } = x;
 
         // Header
@@ -57,11 +61,18 @@ where
             header |= flag::S;
         }
         let mut n_exts = (ext_qos.is_some() as u8)
-            + (ext_shm.is_some() as u8)
+            + (ext_qos_link.is_some() as u8)
             + (ext_auth.is_some() as u8)
             + (ext_mlink.is_some() as u8)
             + (ext_lowlatency.is_some() as u8)
-            + (ext_compression.is_some() as u8);
+            + (ext_compression.is_some() as u8)
+            + (*ext_patch != ext::PatchType::NONE) as u8;
+
+        #[cfg(feature = "shared-memory")]
+        {
+            n_exts += ext_shm.is_some() as u8;
+        }
+
         if n_exts != 0 {
             header |= flag::Z;
         }
@@ -91,6 +102,11 @@ where
             n_exts -= 1;
             self.write(&mut *writer, (qos, n_exts != 0))?;
         }
+        if let Some(qos_link) = ext_qos_link.as_ref() {
+            n_exts -= 1;
+            self.write(&mut *writer, (qos_link, n_exts != 0))?;
+        }
+        #[cfg(feature = "shared-memory")]
         if let Some(shm) = ext_shm.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (shm, n_exts != 0))?;
@@ -110,6 +126,10 @@ where
         if let Some(compression) = ext_compression.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (compression, n_exts != 0))?;
+        }
+        if *ext_patch != ext::PatchType::NONE {
+            n_exts -= 1;
+            self.write(&mut *writer, (*ext_patch, n_exts != 0))?;
         }
 
         Ok(())
@@ -152,7 +172,7 @@ where
         };
         let length = 1 + ((flags >> 4) as usize);
         let lodec = Zenoh080Length::new(length);
-        let zid: ZenohId = lodec.read(&mut *reader)?;
+        let zid: ZenohIdProto = lodec.read(&mut *reader)?;
 
         let mut resolution = Resolution::default();
         let mut batch_size = batch_size::UNICAST.to_le_bytes();
@@ -165,11 +185,14 @@ where
 
         // Extensions
         let mut ext_qos = None;
+        let mut ext_qos_link = None;
+        #[cfg(feature = "shared-memory")]
         let mut ext_shm = None;
         let mut ext_auth = None;
         let mut ext_mlink = None;
         let mut ext_lowlatency = None;
         let mut ext_compression = None;
+        let mut ext_patch = ext::PatchType::NONE;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -181,6 +204,12 @@ where
                     ext_qos = Some(q);
                     has_ext = ext;
                 }
+                ext::QoSLink::ID => {
+                    let (q, ext): (ext::QoSLink, bool) = eodec.read(&mut *reader)?;
+                    ext_qos_link = Some(q);
+                    has_ext = ext;
+                }
+                #[cfg(feature = "shared-memory")]
                 ext::Shm::ID => {
                     let (s, ext): (ext::Shm, bool) = eodec.read(&mut *reader)?;
                     ext_shm = Some(s);
@@ -206,6 +235,11 @@ where
                     ext_compression = Some(q);
                     has_ext = ext;
                 }
+                ext::Patch::ID => {
+                    let (p, ext): (ext::PatchType, bool) = eodec.read(&mut *reader)?;
+                    ext_patch = p;
+                    has_ext = ext;
+                }
                 _ => {
                     has_ext = extension::skip(reader, "InitSyn", ext)?;
                 }
@@ -219,11 +253,14 @@ where
             resolution,
             batch_size,
             ext_qos,
+            ext_qos_link,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_patch,
         })
     }
 }
@@ -244,11 +281,14 @@ where
             batch_size,
             cookie,
             ext_qos,
+            ext_qos_link,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_patch,
         } = x;
 
         // Header
@@ -257,11 +297,18 @@ where
             header |= flag::S;
         }
         let mut n_exts = (ext_qos.is_some() as u8)
-            + (ext_shm.is_some() as u8)
+            + (ext_qos_link.is_some() as u8)
             + (ext_auth.is_some() as u8)
             + (ext_mlink.is_some() as u8)
             + (ext_lowlatency.is_some() as u8)
-            + (ext_compression.is_some() as u8);
+            + (ext_compression.is_some() as u8)
+            + (*ext_patch != ext::PatchType::NONE) as u8;
+
+        #[cfg(feature = "shared-memory")]
+        {
+            n_exts += ext_shm.is_some() as u8;
+        }
+
         if n_exts != 0 {
             header |= flag::Z;
         }
@@ -294,6 +341,11 @@ where
             n_exts -= 1;
             self.write(&mut *writer, (qos, n_exts != 0))?;
         }
+        if let Some(qos_link) = ext_qos_link.as_ref() {
+            n_exts -= 1;
+            self.write(&mut *writer, (qos_link, n_exts != 0))?;
+        }
+        #[cfg(feature = "shared-memory")]
         if let Some(shm) = ext_shm.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (shm, n_exts != 0))?;
@@ -313,6 +365,10 @@ where
         if let Some(compression) = ext_compression.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (compression, n_exts != 0))?;
+        }
+        if *ext_patch != ext::PatchType::NONE {
+            n_exts -= 1;
+            self.write(&mut *writer, (*ext_patch, n_exts != 0))?;
         }
 
         Ok(())
@@ -355,7 +411,7 @@ where
         };
         let length = 1 + ((flags >> 4) as usize);
         let lodec = Zenoh080Length::new(length);
-        let zid: ZenohId = lodec.read(&mut *reader)?;
+        let zid: ZenohIdProto = lodec.read(&mut *reader)?;
 
         let mut resolution = Resolution::default();
         let mut batch_size = batch_size::UNICAST.to_le_bytes();
@@ -371,11 +427,14 @@ where
 
         // Extensions
         let mut ext_qos = None;
+        let mut ext_qos_link = None;
+        #[cfg(feature = "shared-memory")]
         let mut ext_shm = None;
         let mut ext_auth = None;
         let mut ext_mlink = None;
         let mut ext_lowlatency = None;
         let mut ext_compression = None;
+        let mut ext_patch = ext::PatchType::NONE;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -387,6 +446,12 @@ where
                     ext_qos = Some(q);
                     has_ext = ext;
                 }
+                ext::QoSLink::ID => {
+                    let (q, ext): (ext::QoSLink, bool) = eodec.read(&mut *reader)?;
+                    ext_qos_link = Some(q);
+                    has_ext = ext;
+                }
+                #[cfg(feature = "shared-memory")]
                 ext::Shm::ID => {
                     let (s, ext): (ext::Shm, bool) = eodec.read(&mut *reader)?;
                     ext_shm = Some(s);
@@ -412,6 +477,11 @@ where
                     ext_compression = Some(q);
                     has_ext = ext;
                 }
+                ext::Patch::ID => {
+                    let (p, ext): (ext::PatchType, bool) = eodec.read(&mut *reader)?;
+                    ext_patch = p;
+                    has_ext = ext;
+                }
                 _ => {
                     has_ext = extension::skip(reader, "InitAck", ext)?;
                 }
@@ -426,11 +496,14 @@ where
             batch_size,
             cookie,
             ext_qos,
+            ext_qos_link,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_patch,
         })
     }
 }

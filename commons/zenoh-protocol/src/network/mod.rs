@@ -12,6 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 pub mod declare;
+pub mod interest;
 pub mod oam;
 pub mod push;
 pub mod request;
@@ -20,16 +21,16 @@ pub mod response;
 use core::fmt;
 
 pub use declare::{
-    Declare, DeclareBody, DeclareInterest, DeclareKeyExpr, DeclareQueryable, DeclareSubscriber,
-    DeclareToken, UndeclareInterest, UndeclareKeyExpr, UndeclareQueryable, UndeclareSubscriber,
-    UndeclareToken,
+    Declare, DeclareBody, DeclareFinal, DeclareKeyExpr, DeclareQueryable, DeclareSubscriber,
+    DeclareToken, UndeclareKeyExpr, UndeclareQueryable, UndeclareSubscriber, UndeclareToken,
 };
+pub use interest::Interest;
 pub use oam::Oam;
 pub use push::Push;
 pub use request::{AtomicRequestId, Request, RequestId};
 pub use response::{Response, ResponseFinal};
 
-use crate::core::{CongestionControl, Priority};
+use crate::core::{CongestionControl, Priority, Reliability, WireExpr};
 
 pub mod id {
     // WARNING: it's crucial that these IDs do NOT collide with the IDs
@@ -40,6 +41,7 @@ pub mod id {
     pub const REQUEST: u8 = 0x1c;
     pub const RESPONSE: u8 = 0x1b;
     pub const RESPONSE_FINAL: u8 = 0x1a;
+    pub const INTEREST: u8 = 0x19;
 }
 
 #[repr(u8)]
@@ -51,6 +53,8 @@ pub enum Mapping {
 }
 
 impl Mapping {
+    pub const DEFAULT: Self = Self::Receiver;
+
     #[cfg(feature = "test")]
     pub fn rand() -> Self {
         use rand::Rng;
@@ -71,15 +75,183 @@ pub enum NetworkBody {
     Request(Request),
     Response(Response),
     ResponseFinal(ResponseFinal),
+    Interest(Interest),
     Declare(Declare),
     OAM(Oam),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum NetworkBodyRef<'a> {
+    Push(&'a Push),
+    Request(&'a Request),
+    Response(&'a Response),
+    ResponseFinal(&'a ResponseFinal),
+    Interest(&'a Interest),
+    Declare(&'a Declare),
+    OAM(&'a Oam),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetworkBodyMut<'a> {
+    Push(&'a mut Push),
+    Request(&'a mut Request),
+    Response(&'a mut Response),
+    ResponseFinal(&'a mut ResponseFinal),
+    Interest(&'a mut Interest),
+    Declare(&'a mut Declare),
+    OAM(&'a mut Oam),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkMessage {
     pub body: NetworkBody,
-    #[cfg(feature = "stats")]
-    pub size: Option<core::num::NonZeroUsize>,
+    pub reliability: Reliability,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct NetworkMessageRef<'a> {
+    pub body: NetworkBodyRef<'a>,
+    pub reliability: Reliability,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NetworkMessageMut<'a> {
+    pub body: NetworkBodyMut<'a>,
+    pub reliability: Reliability,
+}
+
+pub trait NetworkMessageExt {
+    #[doc(hidden)]
+    fn body(&self) -> NetworkBodyRef;
+    #[doc(hidden)]
+    fn reliability(&self) -> Reliability;
+
+    #[inline]
+    fn is_reliable(&self) -> bool {
+        self.reliability() == Reliability::Reliable
+    }
+
+    #[inline]
+    fn is_express(&self) -> bool {
+        match self.body() {
+            NetworkBodyRef::Push(msg) => msg.ext_qos.is_express(),
+            NetworkBodyRef::Request(msg) => msg.ext_qos.is_express(),
+            NetworkBodyRef::Response(msg) => msg.ext_qos.is_express(),
+            NetworkBodyRef::ResponseFinal(msg) => msg.ext_qos.is_express(),
+            NetworkBodyRef::Interest(msg) => msg.ext_qos.is_express(),
+            NetworkBodyRef::Declare(msg) => msg.ext_qos.is_express(),
+            NetworkBodyRef::OAM(msg) => msg.ext_qos.is_express(),
+        }
+    }
+
+    #[inline]
+    fn is_droppable(&self) -> bool {
+        if !self.is_reliable() {
+            return true;
+        }
+
+        let cc = match self.body() {
+            NetworkBodyRef::Push(msg) => msg.ext_qos.get_congestion_control(),
+            NetworkBodyRef::Request(msg) => msg.ext_qos.get_congestion_control(),
+            NetworkBodyRef::Response(msg) => msg.ext_qos.get_congestion_control(),
+            NetworkBodyRef::ResponseFinal(msg) => msg.ext_qos.get_congestion_control(),
+            NetworkBodyRef::Interest(msg) => msg.ext_qos.get_congestion_control(),
+            NetworkBodyRef::Declare(msg) => msg.ext_qos.get_congestion_control(),
+            NetworkBodyRef::OAM(msg) => msg.ext_qos.get_congestion_control(),
+        };
+
+        cc == CongestionControl::Drop
+    }
+
+    #[inline]
+    fn priority(&self) -> Priority {
+        match self.body() {
+            NetworkBodyRef::Push(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::Request(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::Response(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::ResponseFinal(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::Interest(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::Declare(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::OAM(msg) => msg.ext_qos.get_priority(),
+        }
+    }
+
+    #[inline]
+    fn wire_expr(&self) -> Option<&WireExpr> {
+        match &self.body() {
+            NetworkBodyRef::Push(m) => Some(&m.wire_expr),
+            NetworkBodyRef::Request(m) => Some(&m.wire_expr),
+            NetworkBodyRef::Response(m) => Some(&m.wire_expr),
+            NetworkBodyRef::ResponseFinal(_) => None,
+            NetworkBodyRef::Interest(m) => m.wire_expr.as_ref(),
+            NetworkBodyRef::Declare(m) => match &m.body {
+                DeclareBody::DeclareKeyExpr(m) => Some(&m.wire_expr),
+                DeclareBody::UndeclareKeyExpr(_) => None,
+                DeclareBody::DeclareSubscriber(m) => Some(&m.wire_expr),
+                DeclareBody::UndeclareSubscriber(m) => Some(&m.ext_wire_expr.wire_expr),
+                DeclareBody::DeclareQueryable(m) => Some(&m.wire_expr),
+                DeclareBody::UndeclareQueryable(m) => Some(&m.ext_wire_expr.wire_expr),
+                DeclareBody::DeclareToken(m) => Some(&m.wire_expr),
+                DeclareBody::UndeclareToken(m) => Some(&m.ext_wire_expr.wire_expr),
+                DeclareBody::DeclareFinal(_) => None,
+            },
+            NetworkBodyRef::OAM(_) => None,
+        }
+    }
+
+    #[inline]
+    fn as_ref(&self) -> NetworkMessageRef {
+        NetworkMessageRef {
+            body: self.body(),
+            reliability: self.reliability(),
+        }
+    }
+}
+
+impl NetworkMessageExt for NetworkMessage {
+    fn body(&self) -> NetworkBodyRef {
+        match &self.body {
+            NetworkBody::Push(body) => NetworkBodyRef::Push(body),
+            NetworkBody::Request(body) => NetworkBodyRef::Request(body),
+            NetworkBody::Response(body) => NetworkBodyRef::Response(body),
+            NetworkBody::ResponseFinal(body) => NetworkBodyRef::ResponseFinal(body),
+            NetworkBody::Interest(body) => NetworkBodyRef::Interest(body),
+            NetworkBody::Declare(body) => NetworkBodyRef::Declare(body),
+            NetworkBody::OAM(body) => NetworkBodyRef::OAM(body),
+        }
+    }
+
+    fn reliability(&self) -> Reliability {
+        self.reliability
+    }
+}
+
+impl NetworkMessageExt for NetworkMessageRef<'_> {
+    fn body(&self) -> NetworkBodyRef {
+        self.body
+    }
+
+    fn reliability(&self) -> Reliability {
+        self.reliability
+    }
+}
+
+impl NetworkMessageExt for NetworkMessageMut<'_> {
+    fn body(&self) -> NetworkBodyRef {
+        match &self.body {
+            NetworkBodyMut::Push(body) => NetworkBodyRef::Push(body),
+            NetworkBodyMut::Request(body) => NetworkBodyRef::Request(body),
+            NetworkBodyMut::Response(body) => NetworkBodyRef::Response(body),
+            NetworkBodyMut::ResponseFinal(body) => NetworkBodyRef::ResponseFinal(body),
+            NetworkBodyMut::Interest(body) => NetworkBodyRef::Interest(body),
+            NetworkBodyMut::Declare(body) => NetworkBodyRef::Declare(body),
+            NetworkBodyMut::OAM(body) => NetworkBodyRef::OAM(body),
+        }
+    }
+
+    fn reliability(&self) -> Reliability {
+        self.reliability
+    }
 }
 
 impl NetworkMessage {
@@ -103,53 +275,65 @@ impl NetworkMessage {
     }
 
     #[inline]
-    pub fn is_reliable(&self) -> bool {
-        // TODO
-        true
-    }
-
-    #[inline]
-    pub fn is_droppable(&self) -> bool {
-        if !self.is_reliable() {
-            return true;
-        }
-
-        let cc = match &self.body {
-            NetworkBody::Declare(msg) => msg.ext_qos.get_congestion_control(),
-            NetworkBody::Push(msg) => msg.ext_qos.get_congestion_control(),
-            NetworkBody::Request(msg) => msg.ext_qos.get_congestion_control(),
-            NetworkBody::Response(msg) => msg.ext_qos.get_congestion_control(),
-            NetworkBody::ResponseFinal(msg) => msg.ext_qos.get_congestion_control(),
-            NetworkBody::OAM(msg) => msg.ext_qos.get_congestion_control(),
+    pub fn as_mut(&mut self) -> NetworkMessageMut {
+        let body = match &mut self.body {
+            NetworkBody::Push(body) => NetworkBodyMut::Push(body),
+            NetworkBody::Request(body) => NetworkBodyMut::Request(body),
+            NetworkBody::Response(body) => NetworkBodyMut::Response(body),
+            NetworkBody::ResponseFinal(body) => NetworkBodyMut::ResponseFinal(body),
+            NetworkBody::Interest(body) => NetworkBodyMut::Interest(body),
+            NetworkBody::Declare(body) => NetworkBodyMut::Declare(body),
+            NetworkBody::OAM(body) => NetworkBodyMut::OAM(body),
         };
-
-        cc == CongestionControl::Drop
+        NetworkMessageMut {
+            body,
+            reliability: self.reliability,
+        }
     }
+}
 
+impl NetworkMessageMut<'_> {
     #[inline]
-    pub fn priority(&self) -> Priority {
+    pub fn as_mut(&mut self) -> NetworkMessageMut {
+        let body = match &mut self.body {
+            NetworkBodyMut::Push(body) => NetworkBodyMut::Push(body),
+            NetworkBodyMut::Request(body) => NetworkBodyMut::Request(body),
+            NetworkBodyMut::Response(body) => NetworkBodyMut::Response(body),
+            NetworkBodyMut::ResponseFinal(body) => NetworkBodyMut::ResponseFinal(body),
+            NetworkBodyMut::Interest(body) => NetworkBodyMut::Interest(body),
+            NetworkBodyMut::Declare(body) => NetworkBodyMut::Declare(body),
+            NetworkBodyMut::OAM(body) => NetworkBodyMut::OAM(body),
+        };
+        NetworkMessageMut {
+            body,
+            reliability: self.reliability,
+        }
+    }
+}
+
+impl fmt::Display for NetworkMessageRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.body {
-            NetworkBody::Declare(msg) => msg.ext_qos.get_priority(),
-            NetworkBody::Push(msg) => msg.ext_qos.get_priority(),
-            NetworkBody::Request(msg) => msg.ext_qos.get_priority(),
-            NetworkBody::Response(msg) => msg.ext_qos.get_priority(),
-            NetworkBody::ResponseFinal(msg) => msg.ext_qos.get_priority(),
-            NetworkBody::OAM(msg) => msg.ext_qos.get_priority(),
+            NetworkBodyRef::OAM(_) => write!(f, "OAM"),
+            NetworkBodyRef::Push(_) => write!(f, "Push"),
+            NetworkBodyRef::Request(_) => write!(f, "Request"),
+            NetworkBodyRef::Response(_) => write!(f, "Response"),
+            NetworkBodyRef::ResponseFinal(_) => write!(f, "ResponseFinal"),
+            NetworkBodyRef::Interest(_) => write!(f, "Interest"),
+            NetworkBodyRef::Declare(_) => write!(f, "Declare"),
         }
     }
 }
 
 impl fmt::Display for NetworkMessage {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use NetworkBody::*;
-        match &self.body {
-            OAM(_) => write!(f, "OAM"),
-            Push(_) => write!(f, "Push"),
-            Request(_) => write!(f, "Request"),
-            Response(_) => write!(f, "Response"),
-            ResponseFinal(_) => write!(f, "ResponseFinal"),
-            Declare(_) => write!(f, "Declare"),
-        }
+        self.as_ref().fmt(f)
+    }
+}
+
+impl fmt::Display for NetworkMessageMut<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.as_ref().fmt(f)
     }
 }
 
@@ -158,8 +342,7 @@ impl From<NetworkBody> for NetworkMessage {
     fn from(body: NetworkBody) -> Self {
         Self {
             body,
-            #[cfg(feature = "stats")]
-            size: None,
+            reliability: Reliability::DEFAULT,
         }
     }
 }
@@ -196,11 +379,12 @@ impl From<ResponseFinal> for NetworkMessage {
 
 // Extensions
 pub mod ext {
+    use core::fmt;
+
     use crate::{
         common::{imsg, ZExtZ64},
-        core::{CongestionControl, Priority, ZenohId},
+        core::{CongestionControl, EntityId, Priority, ZenohIdProto},
     };
-    use core::fmt;
 
     /// ```text
     ///  7 6 5 4 3 2 1 0
@@ -226,6 +410,25 @@ pub mod ext {
         const D_FLAG: u8 = 0b00001000;
         const E_FLAG: u8 = 0b00010000;
 
+        pub const DEFAULT: Self = Self::new(Priority::DEFAULT, CongestionControl::DEFAULT, false);
+
+        pub const DECLARE: Self =
+            Self::new(Priority::Control, CongestionControl::DEFAULT_DECLARE, false);
+        pub const PUSH: Self = Self::new(Priority::DEFAULT, CongestionControl::DEFAULT_PUSH, false);
+        pub const REQUEST: Self =
+            Self::new(Priority::DEFAULT, CongestionControl::DEFAULT_REQUEST, false);
+        pub const RESPONSE: Self = Self::new(
+            Priority::DEFAULT,
+            CongestionControl::DEFAULT_RESPONSE,
+            false,
+        );
+        pub const RESPONSE_FINAL: Self = Self::new(
+            Priority::DEFAULT,
+            CongestionControl::DEFAULT_RESPONSE,
+            false,
+        );
+        pub const OAM: Self = Self::new(Priority::Control, CongestionControl::DEFAULT_OAM, false);
+
         pub const fn new(
             priority: Priority,
             congestion_control: CongestionControl,
@@ -242,7 +445,7 @@ pub mod ext {
         }
 
         pub fn set_priority(&mut self, priority: Priority) {
-            self.inner = imsg::set_flag(self.inner, priority as u8);
+            self.inner = imsg::set_bitfield(self.inner, priority as u8, Self::P_MASK);
         }
 
         pub const fn get_priority(&self) -> Priority {
@@ -282,35 +485,11 @@ pub mod ext {
             let inner: u8 = rng.gen();
             Self { inner }
         }
-
-        pub fn declare_default() -> Self {
-            Self::new(Priority::default(), CongestionControl::Block, false)
-        }
-
-        pub fn push_default() -> Self {
-            Self::new(Priority::default(), CongestionControl::Drop, false)
-        }
-
-        pub fn request_default() -> Self {
-            Self::new(Priority::default(), CongestionControl::Block, false)
-        }
-
-        pub fn response_default() -> Self {
-            Self::new(Priority::default(), CongestionControl::Block, false)
-        }
-
-        pub fn response_final_default() -> Self {
-            Self::new(Priority::default(), CongestionControl::Block, false)
-        }
-
-        pub fn oam_default() -> Self {
-            Self::new(Priority::default(), CongestionControl::Block, false)
-        }
     }
 
     impl<const ID: u8> Default for QoSType<{ ID }> {
         fn default() -> Self {
-            Self::new(Priority::default(), CongestionControl::default(), false)
+            Self::new(Priority::DEFAULT, CongestionControl::DEFAULT, false)
         }
     }
 
@@ -358,7 +537,7 @@ pub mod ext {
             let mut rng = rand::thread_rng();
 
             let time = uhlc::NTP64(rng.gen());
-            let id = uhlc::ID::try_from(ZenohId::rand().to_le_bytes()).unwrap();
+            let id = uhlc::ID::try_from(ZenohIdProto::rand().to_le_bytes()).unwrap();
             let timestamp = uhlc::Timestamp::new(time, id);
             Self { timestamp }
         }
@@ -378,6 +557,9 @@ pub mod ext {
     }
 
     impl<const ID: u8> NodeIdType<{ ID }> {
+        // node_id == 0 means the message has been generated by the node itself
+        pub const DEFAULT: Self = Self { node_id: 0 };
+
         #[cfg(feature = "test")]
         pub fn rand() -> Self {
             use rand::Rng;
@@ -389,8 +571,7 @@ pub mod ext {
 
     impl<const ID: u8> Default for NodeIdType<{ ID }> {
         fn default() -> Self {
-            // node_id == 0 means the message has been generated by the node itself
-            Self { node_id: 0 }
+            Self::DEFAULT
         }
     }
 
@@ -408,6 +589,7 @@ pub mod ext {
         }
     }
 
+    /// ```text
     ///  7 6 5 4 3 2 1 0
     /// +-+-+-+-+-+-+-+-+
     /// |zid_len|X|X|X|X|
@@ -416,20 +598,21 @@ pub mod ext {
     /// +---------------+
     /// %      eid      %
     /// +---------------+
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct EntityIdType<const ID: u8> {
-        pub zid: ZenohId,
-        pub eid: u32,
+    pub struct EntityGlobalIdType<const ID: u8> {
+        pub zid: ZenohIdProto,
+        pub eid: EntityId,
     }
 
-    impl<const ID: u8> EntityIdType<{ ID }> {
+    impl<const ID: u8> EntityGlobalIdType<{ ID }> {
         #[cfg(feature = "test")]
         pub fn rand() -> Self {
             use rand::Rng;
             let mut rng = rand::thread_rng();
 
-            let zid = ZenohId::rand();
-            let eid: u32 = rng.gen();
+            let zid = ZenohIdProto::rand();
+            let eid: EntityId = rng.gen();
             Self { zid, eid }
         }
     }

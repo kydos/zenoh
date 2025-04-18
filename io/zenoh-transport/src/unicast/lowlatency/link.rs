@@ -11,27 +11,28 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::TransportUnicastLowlatency;
-#[cfg(feature = "stats")]
-use crate::stats::TransportStats;
-use crate::unicast::link::TransportLinkUnicast;
-use crate::unicast::link::TransportLinkUnicastRx;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use zenoh_buffers::{writer::HasWriter, ZSlice};
 use zenoh_codec::*;
 use zenoh_core::{zasyncread, zasyncwrite};
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::transport::TransportMessageLowLatency;
-use zenoh_protocol::transport::{KeepAlive, TransportBodyLowLatency};
+use zenoh_protocol::transport::{
+    KeepAlive, TransportBodyLowLatencyRef, TransportMessageLowLatencyRef,
+};
 use zenoh_result::{zerror, ZResult};
 use zenoh_runtime::ZRuntime;
 
+use super::transport::TransportUnicastLowlatency;
+#[cfg(feature = "stats")]
+use crate::stats::TransportStats;
+use crate::unicast::link::{TransportLinkUnicast, TransportLinkUnicastRx};
+
 pub(crate) async fn send_with_link(
     link: &LinkUnicast,
-    msg: TransportMessageLowLatency,
+    msg: TransportMessageLowLatencyRef<'_>,
     #[cfg(feature = "stats")] stats: &Arc<TransportStats>,
 ) -> ZResult<()> {
     let len;
@@ -40,7 +41,7 @@ pub(crate) async fn send_with_link(
         let mut buffer = vec![0, 0, 0, 0];
         let mut writer = buffer.writer();
         codec
-            .write(&mut writer, &msg)
+            .write(&mut writer, msg)
             .map_err(|_| zerror!("Error serializing message {:?}", msg))?;
 
         len = (buffer.len() - 4) as u32;
@@ -53,7 +54,7 @@ pub(crate) async fn send_with_link(
         let mut buffer = vec![];
         let mut writer = buffer.writer();
         codec
-            .write(&mut writer, &msg)
+            .write(&mut writer, msg)
             .map_err(|_| zerror!("Error serializing message {:?}", msg))?;
 
         #[cfg(feature = "stats")]
@@ -94,11 +95,11 @@ pub(crate) async fn read_with_link(
 }
 
 impl TransportUnicastLowlatency {
-    pub(super) fn send(&self, msg: TransportMessageLowLatency) -> ZResult<()> {
+    pub(super) fn send(&self, msg: TransportMessageLowLatencyRef) -> ZResult<()> {
         zenoh_runtime::ZRuntime::TX.block_in_place(self.send_async(msg))
     }
 
-    pub(super) async fn send_async(&self, msg: TransportMessageLowLatency) -> ZResult<()> {
+    pub(super) async fn send_async(&self, msg: TransportMessageLowLatencyRef<'_>) -> ZResult<()> {
         let guard = zasyncwrite!(self.link);
         let link = &guard.as_ref().ok_or_else(|| zerror!("No link"))?.link;
         send_with_link(
@@ -133,7 +134,11 @@ impl TransportUnicastLowlatency {
                     c_transport.manager.config.zid,
                     c_transport.config.zid
                 );
-                let _ = c_transport.finalize(0).await;
+
+                // Spawn a task to avoid a deadlock waiting for this same task
+                // to finish in the close() joining its handle
+                // WARN: Must be spawned on RX
+                zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
             }
         };
         self.tracker.spawn_on(task, &ZRuntime::TX);
@@ -153,14 +158,11 @@ impl TransportUnicastLowlatency {
 
             // The pool of buffers
             let pool = {
-                let mtu = if is_streamed {
-                    link_rx.batch.mtu as usize
-                } else {
-                    link_rx.batch.max_buffer_size()
-                };
+                let mtu = link_rx.config.batch.mtu as usize;
                 let mut n = rx_buffer_size / mtu;
-                if rx_buffer_size % mtu != 0 {
-                    n += 1;
+                if n == 0 {
+                    tracing::debug!("RX configured buffer of {rx_buffer_size} bytes is too small for {link_rx} that has an MTU of {mtu} bytes. Defaulting to {mtu} bytes for RX buffer.");
+                    n = 1;
                 }
                 zenoh_sync::RecyclingObjectPool::new(n, move || vec![0_u8; mtu].into_boxed_slice())
             };
@@ -180,7 +182,7 @@ impl TransportUnicastLowlatency {
                         }
 
                         // Deserialize all the messages from the current ZBuf
-                        let zslice = ZSlice::make(Arc::new(buffer), 0, bytes).unwrap();
+                        let zslice = ZSlice::new(Arc::new(buffer), 0, bytes).unwrap();
                         c_transport.read_messages(zslice, &link_rx.link).await?;
                     }
 
@@ -206,7 +208,11 @@ impl TransportUnicastLowlatency {
                         c_transport.manager.config.zid,
                         c_transport.config.zid
                     );
-                    let _ = c_transport.finalize(0).await;
+
+                    // Spawn a task to avoid a deadlock waiting for this same task
+                    // to finish in the close() joining its handle
+                    // WARN: Must be spawned on RX
+                    zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
                 }
             },
             &ZRuntime::RX,
@@ -229,8 +235,8 @@ async fn keepalive_task(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let keepailve = TransportMessageLowLatency {
-                    body: TransportBodyLowLatency::KeepAlive(KeepAlive),
+                let keepailve = TransportMessageLowLatencyRef {
+                    body: TransportBodyLowLatencyRef::KeepAlive(KeepAlive),
                 };
 
                 let guard = zasyncwrite!(link);

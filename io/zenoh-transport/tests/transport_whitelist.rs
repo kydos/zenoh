@@ -12,11 +12,12 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{any::Any, convert::TryFrom, iter::FromIterator, sync::Arc, time::Duration};
+
 use zenoh_core::ztimeout;
 use zenoh_link::Link;
 use zenoh_protocol::{
-    core::{EndPoint, ZenohId},
-    network::NetworkMessage,
+    core::{EndPoint, ZenohIdProto},
+    network::NetworkMessageMut,
 };
 use zenoh_result::ZResult;
 use zenoh_transport::{
@@ -51,13 +52,12 @@ impl TransportEventHandler for SHRouter {
 pub struct SCRouter;
 
 impl TransportPeerEventHandler for SCRouter {
-    fn handle_message(&self, _message: NetworkMessage) -> ZResult<()> {
+    fn handle_message(&self, _message: NetworkMessageMut) -> ZResult<()> {
         Ok(())
     }
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {
@@ -67,7 +67,7 @@ impl TransportPeerEventHandler for SCRouter {
 
 async fn run(endpoints: &[EndPoint]) {
     // Define client and router IDs
-    let router_id = ZenohId::try_from([1]).unwrap();
+    let router_id = ZenohIdProto::try_from([1]).unwrap();
 
     // Create the router transport manager
     println!(">>> Transport Whitelist [1a1]");
@@ -117,7 +117,7 @@ async fn run(endpoints: &[EndPoint]) {
 #[cfg(feature = "transport_tcp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_whitelist_tcp() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![
@@ -132,7 +132,7 @@ async fn transport_whitelist_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn transport_whitelist_unixpipe() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![
@@ -146,7 +146,7 @@ async fn transport_whitelist_unixpipe() {
 #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_whitelist_vsock() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![

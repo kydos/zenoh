@@ -11,23 +11,27 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-// use super::properties::EstablishmentProperties;
-use crate::unicast::establishment::ext;
 use std::convert::TryFrom;
+
 use zenoh_buffers::{
     reader::{DidntRead, HasReader, Reader},
     writer::{DidntWrite, HasWriter, Writer},
 };
 use zenoh_codec::{RCodec, WCodec, Zenoh080};
 use zenoh_crypto::{BlockCipher, PseudoRng};
-use zenoh_protocol::core::{Resolution, WhatAmI, ZenohId};
+use zenoh_protocol::{
+    core::{Resolution, WhatAmI, ZenohIdProto},
+    transport::BatchSize,
+};
+
+use crate::unicast::establishment::ext;
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Cookie {
-    pub(crate) zid: ZenohId,
+    pub(crate) zid: ZenohIdProto,
     pub(crate) whatami: WhatAmI,
     pub(crate) resolution: Resolution,
-    pub(crate) batch_size: u16,
+    pub(crate) batch_size: BatchSize,
     pub(crate) nonce: u64,
     // Extensions
     pub(crate) ext_qos: ext::qos::StateAccept,
@@ -40,6 +44,7 @@ pub(crate) struct Cookie {
     pub(crate) ext_lowlatency: ext::lowlatency::StateAccept,
     #[cfg(feature = "transport_compression")]
     pub(crate) ext_compression: ext::compression::StateAccept,
+    pub(crate) ext_patch: ext::patch::StateAccept,
 }
 
 impl<W> WCodec<&Cookie, &mut W> for Zenoh080
@@ -66,6 +71,7 @@ where
         self.write(&mut *writer, &x.ext_lowlatency)?;
         #[cfg(feature = "transport_compression")]
         self.write(&mut *writer, &x.ext_compression)?;
+        self.write(&mut *writer, &x.ext_patch)?;
 
         Ok(())
     }
@@ -78,12 +84,12 @@ where
     type Error = DidntRead;
 
     fn read(self, reader: &mut R) -> Result<Cookie, Self::Error> {
-        let zid: ZenohId = self.read(&mut *reader)?;
+        let zid: ZenohIdProto = self.read(&mut *reader)?;
         let wai: u8 = self.read(&mut *reader)?;
         let whatami = WhatAmI::try_from(wai).map_err(|_| DidntRead)?;
         let resolution: u8 = self.read(&mut *reader)?;
         let resolution = Resolution::from(resolution);
-        let batch_size: u16 = self.read(&mut *reader)?;
+        let batch_size: BatchSize = self.read(&mut *reader)?;
         let nonce: u64 = self.read(&mut *reader)?;
         // Extensions
         let ext_qos: ext::qos::StateAccept = self.read(&mut *reader)?;
@@ -96,6 +102,7 @@ where
         let ext_lowlatency: ext::lowlatency::StateAccept = self.read(&mut *reader)?;
         #[cfg(feature = "transport_compression")]
         let ext_compression: ext::compression::StateAccept = self.read(&mut *reader)?;
+        let ext_patch: ext::patch::StateAccept = self.read(&mut *reader)?;
 
         let cookie = Cookie {
             zid,
@@ -113,6 +120,7 @@ where
             ext_lowlatency,
             #[cfg(feature = "transport_compression")]
             ext_compression,
+            ext_patch,
         };
 
         Ok(cookie)
@@ -169,7 +177,7 @@ impl Cookie {
         let mut rng = rand::thread_rng();
 
         Self {
-            zid: ZenohId::default(),
+            zid: ZenohIdProto::default(),
             whatami: WhatAmI::rand(),
             resolution: Resolution::rand(),
             batch_size: rng.gen(),
@@ -184,6 +192,7 @@ impl Cookie {
             ext_lowlatency: ext::lowlatency::StateAccept::rand(),
             #[cfg(feature = "transport_compression")]
             ext_compression: ext::compression::StateAccept::rand(),
+            ext_patch: ext::patch::StateAccept::rand(),
         }
     }
 }
@@ -191,9 +200,10 @@ impl Cookie {
 mod tests {
     #[test]
     fn codec_cookie() {
-        use super::*;
         use rand::{Rng, SeedableRng};
         use zenoh_buffers::ZBuf;
+
+        use super::*;
 
         const NUM_ITER: usize = 1_000;
 

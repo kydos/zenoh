@@ -16,15 +16,14 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+
+use std::{future::Future, time::Duration};
 
 use futures::future::FutureExt;
-use std::future::Future;
-use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
-use zenoh_core::{ResolveFuture, SyncResolve};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use zenoh_core::{ResolveFuture, Wait};
 use zenoh_runtime::ZRuntime;
 
 #[derive(Clone)]
@@ -50,6 +49,9 @@ impl TaskController {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        #[cfg(feature = "tracing-instrument")]
+        let future = tracing::Instrument::instrument(future, tracing::Span::current());
+
         let token = self.token.child_token();
         let task = async move {
             tokio::select! {
@@ -57,6 +59,7 @@ impl TaskController {
                 _ = future => {}
             }
         };
+
         self.tracker.spawn(task)
     }
 
@@ -67,6 +70,9 @@ impl TaskController {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        #[cfg(feature = "tracing-instrument")]
+        let future = tracing::Instrument::instrument(future, tracing::Span::current());
+
         let token = self.token.child_token();
         let task = async move {
             tokio::select! {
@@ -89,6 +95,9 @@ impl TaskController {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        #[cfg(feature = "tracing-instrument")]
+        let future = tracing::Instrument::instrument(future, tracing::Span::current());
+
         self.tracker.spawn(future.map(|_f| ()))
     }
 
@@ -100,6 +109,9 @@ impl TaskController {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        #[cfg(feature = "tracing-instrument")]
+        let future = tracing::Instrument::instrument(future, tracing::Span::current());
+
         self.tracker.spawn_on(future.map(|_f| ()), &rt)
     }
 
@@ -111,21 +123,23 @@ impl TaskController {
     /// The call blocks until all tasks yield or timeout duration expires.
     /// Returns 0 in case of success, number of non terminated tasks otherwise.
     pub fn terminate_all(&self, timeout: Duration) -> usize {
-        ResolveFuture::new(async move { self.terminate_all_async(timeout).await }).res_sync()
+        ResolveFuture::new(async move {
+            if tokio::time::timeout(timeout, self.terminate_all_async())
+                .await
+                .is_err()
+            {
+                tracing::error!("Failed to terminate {} tasks", self.tracker.len());
+            }
+            self.tracker.len()
+        })
+        .wait()
     }
 
     /// Async version of [`TaskController::terminate_all()`].
-    pub async fn terminate_all_async(&self, timeout: Duration) -> usize {
+    pub async fn terminate_all_async(&self) {
         self.tracker.close();
         self.token.cancel();
-        if tokio::time::timeout(timeout, self.tracker.wait())
-            .await
-            .is_err()
-        {
-            tracing::error!("Failed to terminate {} tasks", self.tracker.len());
-            return self.tracker.len();
-        }
-        0
+        self.tracker.wait().await
     }
 }
 
@@ -182,18 +196,24 @@ impl TerminatableTask {
     /// Attempts to terminate the task.
     /// Returns true if task completed / aborted within timeout duration, false otherwise.
     pub fn terminate(&mut self, timeout: Duration) -> bool {
-        ResolveFuture::new(async move { self.terminate_async(timeout).await }).res_sync()
-    }
-
-    /// Async version of [`TerminatableTask::terminate()`].
-    pub async fn terminate_async(&mut self, timeout: Duration) -> bool {
-        self.token.cancel();
-        if let Some(handle) = self.handle.take() {
-            if tokio::time::timeout(timeout, handle).await.is_err() {
+        ResolveFuture::new(async move {
+            if tokio::time::timeout(timeout, self.terminate_async())
+                .await
+                .is_err()
+            {
                 tracing::error!("Failed to terminate the task");
                 return false;
             };
+            true
+        })
+        .wait()
+    }
+
+    /// Async version of [`TerminatableTask::terminate()`].
+    pub async fn terminate_async(&mut self) {
+        self.token.cancel();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
         }
-        true
     }
 }

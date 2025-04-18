@@ -11,21 +11,25 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::super::router::*;
-use super::tables::TablesLock;
-use super::{resource::*, tables};
-use crate::net::primitives::{McastMux, Mux, Primitives};
-use crate::net::routing::interceptor::{InterceptorTrait, InterceptorsChain};
-use crate::KeyExpr;
-use std::any::Any;
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::{Arc, Weak};
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt,
+    ops::Not,
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+use ahash::HashMapExt;
+use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
-use zenoh_protocol::zenoh::RequestBody;
 use zenoh_protocol::{
-    core::{ExprId, WhatAmI, ZenohId},
-    network::{Mapping, Push, Request, RequestId, Response, ResponseFinal},
+    core::{ExprId, Reliability, WhatAmI, ZenohIdProto},
+    network::{
+        interest::{InterestId, InterestMode, InterestOptions},
+        Mapping, Push, Request, RequestId, Response, ResponseFinal,
+    },
+    zenoh::RequestBody,
 };
 use zenoh_sync::get_mut_unchecked;
 use zenoh_task::TaskController;
@@ -33,34 +37,62 @@ use zenoh_transport::multicast::TransportMulticast;
 #[cfg(feature = "stats")]
 use zenoh_transport::stats::TransportStats;
 
+use super::{
+    super::router::*,
+    interests::{declare_final, declare_interest, undeclare_interest, PendingCurrentInterest},
+    resource::*,
+    tables::TablesLock,
+};
+use crate::net::{
+    primitives::{McastMux, Mux, Primitives},
+    routing::{
+        dispatcher::interests::finalize_pending_interests,
+        interceptor::{
+            EgressInterceptor, IngressInterceptor, InterceptorFactory, InterceptorTrait,
+            InterceptorsChain,
+        },
+    },
+};
+
+pub(crate) struct InterestState {
+    pub(crate) options: InterestOptions,
+    pub(crate) res: Option<Arc<Resource>>,
+    pub(crate) finalized: bool,
+}
+
 pub struct FaceState {
     pub(crate) id: usize,
-    pub(crate) zid: ZenohId,
+    pub(crate) zid: ZenohIdProto,
     pub(crate) whatami: WhatAmI,
     #[cfg(feature = "stats")]
     pub(crate) stats: Option<Arc<TransportStats>>,
     pub(crate) primitives: Arc<dyn crate::net::primitives::EPrimitives + Send + Sync>,
-    pub(crate) local_mappings: HashMap<ExprId, Arc<Resource>>,
-    pub(crate) remote_mappings: HashMap<ExprId, Arc<Resource>>,
+    pub(crate) local_interests: HashMap<InterestId, InterestState>,
+    pub(crate) remote_key_interests: HashMap<InterestId, Option<Arc<Resource>>>,
+    pub(crate) pending_current_interests: HashMap<InterestId, PendingCurrentInterest>,
+    pub(crate) local_mappings: ahash::HashMap<ExprId, Arc<Resource>>,
+    pub(crate) remote_mappings: ahash::HashMap<ExprId, Arc<Resource>>,
     pub(crate) next_qid: RequestId,
     pub(crate) pending_queries: HashMap<RequestId, (Arc<Query>, CancellationToken)>,
     pub(crate) mcast_group: Option<TransportMulticast>,
-    pub(crate) in_interceptors: Option<Arc<InterceptorsChain>>,
+    pub(crate) in_interceptors: Option<Arc<ArcSwap<InterceptorsChain>>>,
     pub(crate) hat: Box<dyn Any + Send + Sync>,
     pub(crate) task_controller: TaskController,
+    pub(crate) is_local: bool,
 }
 
 impl FaceState {
     #[allow(clippy::too_many_arguments)] // @TODO fix warning
     pub(crate) fn new(
         id: usize,
-        zid: ZenohId,
+        zid: ZenohIdProto,
         whatami: WhatAmI,
         #[cfg(feature = "stats")] stats: Option<Arc<TransportStats>>,
         primitives: Arc<dyn crate::net::primitives::EPrimitives + Send + Sync>,
         mcast_group: Option<TransportMulticast>,
-        in_interceptors: Option<Arc<InterceptorsChain>>,
+        in_interceptors: Option<Arc<ArcSwap<InterceptorsChain>>>,
         hat: Box<dyn Any + Send + Sync>,
+        is_local: bool,
     ) -> Arc<FaceState> {
         Arc::new(FaceState {
             id,
@@ -69,14 +101,18 @@ impl FaceState {
             #[cfg(feature = "stats")]
             stats,
             primitives,
-            local_mappings: HashMap::new(),
-            remote_mappings: HashMap::new(),
+            local_interests: HashMap::new(),
+            remote_key_interests: HashMap::new(),
+            pending_current_interests: HashMap::new(),
+            local_mappings: ahash::HashMap::new(),
+            remote_mappings: ahash::HashMap::new(),
             next_qid: 0,
             pending_queries: HashMap::new(),
             mcast_group,
             in_interceptors,
             hat,
             task_controller: TaskController::default(),
+            is_local,
         })
     }
 
@@ -113,37 +149,104 @@ impl FaceState {
     }
 
     pub(crate) fn update_interceptors_caches(&self, res: &mut Arc<Resource>) {
-        if let Ok(expr) = KeyExpr::try_from(res.expr()) {
-            if let Some(interceptor) = self.in_interceptors.as_ref() {
-                let cache = interceptor.compute_keyexpr_cache(&expr);
+        if let Some(interceptor) = self
+            .in_interceptors
+            .as_ref()
+            .map(|itor| itor.load())
+            .and_then(|is| is.is_empty().not().then_some(is))
+        {
+            if let Some(expr) = res.keyexpr() {
+                let cache = interceptor.compute_keyexpr_cache(expr);
                 get_mut_unchecked(
                     get_mut_unchecked(res)
                         .session_ctxs
                         .get_mut(&self.id)
                         .unwrap(),
                 )
-                .in_interceptor_cache = cache;
+                .in_interceptor_cache = InterceptorCache::new(cache, interceptor.version);
             }
-            if let Some(mux) = self.primitives.as_any().downcast_ref::<Mux>() {
-                let cache = mux.interceptor.compute_keyexpr_cache(&expr);
+        }
+
+        if let Some(interceptor) = self
+            .primitives
+            .as_any()
+            .downcast_ref::<Mux>()
+            .map(|mux| mux.interceptor.load())
+            .and_then(|is| is.is_empty().not().then_some(is))
+        {
+            if let Some(expr) = res.keyexpr() {
+                let cache = interceptor.compute_keyexpr_cache(expr);
                 get_mut_unchecked(
                     get_mut_unchecked(res)
                         .session_ctxs
                         .get_mut(&self.id)
                         .unwrap(),
                 )
-                .e_interceptor_cache = cache;
+                .e_interceptor_cache = InterceptorCache::new(cache, interceptor.version);
             }
-            if let Some(mux) = self.primitives.as_any().downcast_ref::<McastMux>() {
-                let cache = mux.interceptor.compute_keyexpr_cache(&expr);
+        }
+
+        if let Some(interceptor) = self
+            .primitives
+            .as_any()
+            .downcast_ref::<McastMux>()
+            .map(|mux| mux.interceptor.load())
+            .and_then(|is| is.is_empty().not().then_some(is))
+        {
+            if let Some(expr) = res.keyexpr() {
+                let cache = interceptor.compute_keyexpr_cache(expr);
                 get_mut_unchecked(
                     get_mut_unchecked(res)
                         .session_ctxs
                         .get_mut(&self.id)
                         .unwrap(),
                 )
-                .e_interceptor_cache = cache;
+                .e_interceptor_cache = InterceptorCache::new(cache, interceptor.version);
             }
+        }
+    }
+
+    pub(crate) fn set_interceptors_from_factories(
+        &self,
+        factories: &[InterceptorFactory],
+        version: usize,
+    ) {
+        if let Some(mux) = self.primitives.as_any().downcast_ref::<Mux>() {
+            let (ingress, egress): (Vec<_>, Vec<_>) = factories
+                .iter()
+                .map(|itor| itor.new_transport_unicast(&mux.handler))
+                .unzip();
+            let (ingress, egress) = (
+                InterceptorsChain::new(ingress.into_iter().flatten().collect::<Vec<_>>(), version),
+                InterceptorsChain::new(egress.into_iter().flatten().collect::<Vec<_>>(), version),
+            );
+            mux.interceptor.store(egress.into());
+            self.in_interceptors
+                .as_ref()
+                .expect("face in_interceptors should not be None when primitives are Mux")
+                .store(ingress.into());
+        } else if let Some(mux) = self.primitives.as_any().downcast_ref::<McastMux>() {
+            let interceptor = InterceptorsChain::new(
+                factories
+                    .iter()
+                    .filter_map(|itor| itor.new_transport_multicast(&mux.handler))
+                    .collect::<Vec<EgressInterceptor>>(),
+                version,
+            );
+            mux.interceptor.store(Arc::new(interceptor));
+            debug_assert!(self.in_interceptors.is_none());
+        } else if let Some(transport) = &self.mcast_group {
+            let interceptor = InterceptorsChain::new(
+                factories
+                    .iter()
+                    .filter_map(|itor| itor.new_peer_multicast(transport))
+                    .collect::<Vec<IngressInterceptor>>(),
+                version,
+            );
+            self.in_interceptors
+                .as_ref()
+                .expect("face in_interceptors should not be None when mcast_group is set")
+                .store(interceptor.into());
         }
     }
 }
@@ -154,7 +257,7 @@ impl fmt::Display for FaceState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WeakFace {
     pub(crate) tables: Weak<TablesLock>,
     pub(crate) state: Weak<FaceState>,
@@ -182,12 +285,46 @@ impl Face {
             state: Arc::downgrade(&self.state),
         }
     }
+
+    pub(crate) fn reject_interest(&self, interest_id: u32) {
+        if let Some(interest) = self.state.pending_current_interests.get(&interest_id) {
+            interest.rejection_token.cancel();
+        }
+    }
 }
 
 impl Primitives for Face {
-    fn send_declare(&self, msg: zenoh_protocol::network::Declare) {
+    fn send_interest(&self, msg: &mut zenoh_protocol::network::Interest) {
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
-        match msg.body {
+        if msg.mode != InterestMode::Final {
+            let mut declares = vec![];
+            declare_interest(
+                ctrl_lock.as_ref(),
+                &self.tables,
+                &mut self.state.clone(),
+                msg.id,
+                msg.wire_expr.as_ref(),
+                msg.mode,
+                msg.options,
+                &mut |p, m| declares.push((p.clone(), m)),
+            );
+            drop(ctrl_lock);
+            for (p, m) in declares {
+                m.with_mut(|m| p.send_declare(m));
+            }
+        } else {
+            undeclare_interest(
+                ctrl_lock.as_ref(),
+                &self.tables,
+                &mut self.state.clone(),
+                msg.id,
+            );
+        }
+    }
+
+    fn send_declare(&self, msg: &mut zenoh_protocol::network::Declare) {
+        let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        match &mut msg.body {
             zenoh_protocol::network::DeclareBody::DeclareKeyExpr(m) => {
                 register_expr(&self.tables, &mut self.state.clone(), m.id, &m.wire_expr);
             }
@@ -200,14 +337,15 @@ impl Primitives for Face {
                     ctrl_lock.as_ref(),
                     &self.tables,
                     &mut self.state.clone(),
+                    m.id,
                     &m.wire_expr,
-                    &m.ext_info,
+                    &SubscriberInfo,
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
                 for (p, m) in declares {
-                    p.send_declare(m);
+                    m.with_mut(|m| p.send_declare(m));
                 }
             }
             zenoh_protocol::network::DeclareBody::UndeclareSubscriber(m) => {
@@ -216,13 +354,14 @@ impl Primitives for Face {
                     ctrl_lock.as_ref(),
                     &self.tables,
                     &mut self.state.clone(),
+                    m.id,
                     &m.ext_wire_expr.wire_expr,
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
                 for (p, m) in declares {
-                    p.send_declare(m);
+                    m.with_mut(|m| p.send_declare(m));
                 }
             }
             zenoh_protocol::network::DeclareBody::DeclareQueryable(m) => {
@@ -231,6 +370,7 @@ impl Primitives for Face {
                     ctrl_lock.as_ref(),
                     &self.tables,
                     &mut self.state.clone(),
+                    m.id,
                     &m.wire_expr,
                     &m.ext_info,
                     msg.ext_nodeid.node_id,
@@ -238,7 +378,7 @@ impl Primitives for Face {
                 );
                 drop(ctrl_lock);
                 for (p, m) in declares {
-                    p.send_declare(m);
+                    m.with_mut(|m| p.send_declare(m));
                 }
             }
             zenoh_protocol::network::DeclareBody::UndeclareQueryable(m) => {
@@ -247,77 +387,123 @@ impl Primitives for Face {
                     ctrl_lock.as_ref(),
                     &self.tables,
                     &mut self.state.clone(),
+                    m.id,
                     &m.ext_wire_expr.wire_expr,
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
                 for (p, m) in declares {
-                    p.send_declare(m);
+                    m.with_mut(|m| p.send_declare(m));
                 }
             }
-            zenoh_protocol::network::DeclareBody::DeclareToken(_m) => todo!(),
-            zenoh_protocol::network::DeclareBody::UndeclareToken(_m) => todo!(),
-            zenoh_protocol::network::DeclareBody::DeclareInterest(_m) => todo!(),
-            zenoh_protocol::network::DeclareBody::FinalInterest(_m) => todo!(),
-            zenoh_protocol::network::DeclareBody::UndeclareInterest(_m) => todo!(),
+            zenoh_protocol::network::DeclareBody::DeclareToken(m) => {
+                let mut declares = vec![];
+                declare_token(
+                    ctrl_lock.as_ref(),
+                    &self.tables,
+                    &mut self.state.clone(),
+                    m.id,
+                    &m.wire_expr,
+                    msg.ext_nodeid.node_id,
+                    msg.interest_id,
+                    &mut |p, m| declares.push((p.clone(), m)),
+                );
+                drop(ctrl_lock);
+                for (p, m) in declares {
+                    m.with_mut(|m| p.send_declare(m));
+                }
+            }
+            zenoh_protocol::network::DeclareBody::UndeclareToken(m) => {
+                let mut declares = vec![];
+                undeclare_token(
+                    ctrl_lock.as_ref(),
+                    &self.tables,
+                    &mut self.state.clone(),
+                    m.id,
+                    &m.ext_wire_expr,
+                    msg.ext_nodeid.node_id,
+                    &mut |p, m| declares.push((p.clone(), m)),
+                );
+                drop(ctrl_lock);
+                for (p, m) in declares {
+                    m.with_mut(|m| p.send_declare(m));
+                }
+            }
+            zenoh_protocol::network::DeclareBody::DeclareFinal(_) => {
+                if let Some(id) = msg.interest_id {
+                    get_mut_unchecked(&mut self.state.clone())
+                        .local_interests
+                        .entry(id)
+                        .and_modify(|interest| interest.finalized = true);
+
+                    let mut wtables = zwrite!(self.tables.tables);
+                    let mut declares = vec![];
+                    declare_final(
+                        ctrl_lock.as_ref(),
+                        &mut wtables,
+                        &mut self.state.clone(),
+                        id,
+                        &mut |p, m| declares.push((p.clone(), m)),
+                    );
+
+                    wtables.disable_all_routes();
+
+                    drop(wtables);
+                    drop(ctrl_lock);
+                    for (p, m) in declares {
+                        m.with_mut(|m| p.send_declare(m));
+                    }
+                }
+            }
         }
     }
 
     #[inline]
-    fn send_push(&self, msg: Push) {
-        full_reentrant_route_data(
-            &self.tables,
-            &self.state,
-            &msg.wire_expr,
-            msg.ext_qos,
-            msg.ext_tstamp,
-            msg.payload,
-            msg.ext_nodeid.node_id,
-        );
+    fn send_push(&self, msg: &mut Push, reliability: Reliability) {
+        route_data(&self.tables, &self.state, msg, reliability);
     }
 
-    fn send_request(&self, msg: Request) {
+    fn send_request(&self, msg: &mut Request) {
         match msg.payload {
             RequestBody::Query(_) => {
-                route_query(
-                    &self.tables,
-                    &self.state,
-                    &msg.wire_expr,
-                    msg.id,
-                    msg.ext_target,
-                    msg.ext_budget,
-                    msg.ext_timeout,
-                    msg.payload,
-                    msg.ext_nodeid.node_id,
-                );
-            }
-            RequestBody::Pull(_) => {
-                pull_data(&self.tables.tables, &self.state.clone(), msg.wire_expr);
-            }
-            _ => {
-                tracing::error!("Unsupported request");
+                route_query(&self.tables, &self.state, msg);
             }
         }
     }
 
-    fn send_response(&self, msg: Response) {
-        route_send_response(
-            &self.tables,
-            &mut self.state.clone(),
-            msg.rid,
-            msg.ext_respid,
-            msg.wire_expr,
-            msg.payload,
-        );
+    fn send_response(&self, msg: &mut Response) {
+        route_send_response(&self.tables, &mut self.state.clone(), msg);
     }
 
-    fn send_response_final(&self, msg: ResponseFinal) {
+    fn send_response_final(&self, msg: &mut ResponseFinal) {
         route_send_response_final(&self.tables, &mut self.state.clone(), msg.rid);
     }
 
     fn send_close(&self) {
-        tables::close_face(&self.tables, &Arc::downgrade(&self.state));
+        tracing::debug!("{} Close", self.state);
+        let mut state = self.state.clone();
+        state.task_controller.terminate_all(Duration::from_secs(10));
+        finalize_pending_queries(&self.tables, &mut state);
+        let mut declares = vec![];
+        let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        finalize_pending_interests(&self.tables, &mut state, &mut |p, m| {
+            declares.push((p.clone(), m))
+        });
+        ctrl_lock.close_face(
+            &self.tables,
+            &self.tables.clone(),
+            &mut state,
+            &mut |p, m| declares.push((p.clone(), m)),
+        );
+        drop(ctrl_lock);
+        for (p, m) in declares {
+            m.with_mut(|m| p.send_declare(m));
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

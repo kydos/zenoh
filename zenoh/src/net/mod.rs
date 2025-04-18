@@ -16,14 +16,11 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
-#[doc(hidden)]
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 pub(crate) mod codec;
-#[doc(hidden)]
+mod common;
 pub(crate) mod primitives;
-#[doc(hidden)]
 pub(crate) mod protocol;
-#[doc(hidden)]
 pub(crate) mod routing;
 #[doc(hidden)]
 pub mod runtime;

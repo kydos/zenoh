@@ -11,171 +11,232 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::face::FaceState;
-use super::tables::{Tables, TablesLock};
-use crate::net::routing::dispatcher::face::Face;
-use crate::net::routing::RoutingContext;
-use std::any::Any;
-use std::collections::HashMap;
-use std::convert::TryInto;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak};
+use std::{
+    any::Any,
+    borrow::{Borrow, Cow},
+    collections::{HashMap, VecDeque},
+    convert::TryInto,
+    hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
+    sync::{Arc, RwLock, Weak},
+};
+
+use ahash::HashMapExt;
+use zenoh_collections::SingleOrBoxHashSet;
 use zenoh_config::WhatAmI;
-#[cfg(feature = "complete_n")]
-use zenoh_protocol::network::request::ext::TargetType;
-use zenoh_protocol::network::RequestId;
-use zenoh_protocol::zenoh::PushBody;
 use zenoh_protocol::{
     core::{key_expr::keyexpr, ExprId, WireExpr},
     network::{
-        declare::{
-            ext, queryable::ext::QueryableInfo, subscriber::ext::SubscriberInfo, Declare,
-            DeclareBody, DeclareKeyExpr,
-        },
-        Mapping,
+        declare::{ext, queryable::ext::QueryableInfoType, Declare, DeclareBody, DeclareKeyExpr},
+        interest::InterestId,
+        Mapping, RequestId,
     },
 };
-use zenoh_sync::get_mut_unchecked;
+use zenoh_sync::{get_mut_unchecked, Cache, CacheValueType};
+
+use super::{
+    face::FaceState,
+    pubsub::SubscriberInfo,
+    tables::{Tables, TablesLock},
+};
+use crate::net::routing::{
+    dispatcher::face::Face,
+    interceptor::{InterceptorTrait, InterceptorsChain},
+    router::{disable_matches_data_routes, disable_matches_query_routes},
+    RoutingContext,
+};
 
 pub(crate) type NodeId = u16;
 
 pub(crate) type Direction = (Arc<FaceState>, WireExpr<'static>, NodeId);
 pub(crate) type Route = HashMap<usize, Direction>;
-#[cfg(feature = "complete_n")]
-pub(crate) type QueryRoute = HashMap<usize, (Direction, RequestId, TargetType)>;
-#[cfg(not(feature = "complete_n"))]
+
 pub(crate) type QueryRoute = HashMap<usize, (Direction, RequestId)>;
 pub(crate) struct QueryTargetQabl {
     pub(crate) direction: Direction,
-    pub(crate) complete: u64,
-    pub(crate) distance: f64,
+    pub(crate) info: Option<QueryableInfoType>,
 }
 pub(crate) type QueryTargetQablSet = Vec<QueryTargetQabl>;
-pub(crate) type PullCaches = Vec<Arc<SessionContext>>;
+
+pub(crate) struct InterceptorCache(Cache<Option<Box<dyn Any + Send + Sync>>>);
+pub(crate) type InterceptorCacheValueType = CacheValueType<Option<Box<dyn Any + Send + Sync>>>;
+
+impl InterceptorCache {
+    pub(crate) fn new(value: Option<Box<dyn Any + Send + Sync>>, version: usize) -> Self {
+        Self(Cache::<Option<Box<dyn Any + Send + Sync>>>::new(
+            value, version,
+        ))
+    }
+
+    pub(crate) fn empty() -> Self {
+        InterceptorCache::new(None, 0)
+    }
+
+    #[inline]
+    fn value(
+        &self,
+        interceptor: &InterceptorsChain,
+        resource: &Resource,
+    ) -> Option<InterceptorCacheValueType> {
+        self.0
+            .value(interceptor.version, || {
+                interceptor.compute_keyexpr_cache(resource.keyexpr()?)
+            })
+            .ok()
+    }
+}
 
 pub(crate) struct SessionContext {
     pub(crate) face: Arc<FaceState>,
     pub(crate) local_expr_id: Option<ExprId>,
     pub(crate) remote_expr_id: Option<ExprId>,
     pub(crate) subs: Option<SubscriberInfo>,
-    pub(crate) qabl: Option<QueryableInfo>,
-    pub(crate) last_values: HashMap<String, PushBody>,
-    pub(crate) in_interceptor_cache: Option<Box<dyn Any + Send + Sync>>,
-    pub(crate) e_interceptor_cache: Option<Box<dyn Any + Send + Sync>>,
+    pub(crate) qabl: Option<QueryableInfoType>,
+    pub(crate) token: bool,
+    pub(crate) in_interceptor_cache: InterceptorCache,
+    pub(crate) e_interceptor_cache: InterceptorCache,
 }
 
-#[derive(Default)]
-pub(crate) struct RoutesIndexes {
-    pub(crate) routers: Vec<NodeId>,
-    pub(crate) peers: Vec<NodeId>,
-    pub(crate) clients: Vec<NodeId>,
-}
-
-#[derive(Default)]
-pub(crate) struct DataRoutes {
-    pub(crate) routers: Vec<Arc<Route>>,
-    pub(crate) peers: Vec<Arc<Route>>,
-    pub(crate) clients: Vec<Arc<Route>>,
-}
-
-impl DataRoutes {
-    #[inline]
-    pub(crate) fn get_route(&self, whatami: WhatAmI, context: NodeId) -> Option<Arc<Route>> {
-        match whatami {
-            WhatAmI::Router => (self.routers.len() > context as usize)
-                .then(|| self.routers[context as usize].clone()),
-            WhatAmI::Peer => {
-                (self.peers.len() > context as usize).then(|| self.peers[context as usize].clone())
-            }
-            WhatAmI::Client => (self.clients.len() > context as usize)
-                .then(|| self.clients[context as usize].clone()),
+impl SessionContext {
+    pub(crate) fn new(face: Arc<FaceState>) -> Self {
+        Self {
+            face,
+            local_expr_id: None,
+            remote_expr_id: None,
+            subs: None,
+            qabl: None,
+            token: false,
+            in_interceptor_cache: InterceptorCache::empty(),
+            e_interceptor_cache: InterceptorCache::empty(),
         }
     }
 }
 
-#[derive(Default)]
-pub(crate) struct QueryRoutes {
-    pub(crate) routers: Vec<Arc<QueryTargetQablSet>>,
-    pub(crate) peers: Vec<Arc<QueryTargetQablSet>>,
-    pub(crate) clients: Vec<Arc<QueryTargetQablSet>>,
+/// Global version number for route computation.
+/// Use 64bit to not care about rollover.
+pub type RoutesVersion = u64;
+
+pub(crate) struct Routes<T> {
+    routers: Vec<Option<T>>,
+    peers: Vec<Option<T>>,
+    clients: Vec<Option<T>>,
+    version: u64,
 }
 
-impl QueryRoutes {
+impl<T> Default for Routes<T> {
+    fn default() -> Self {
+        Self {
+            routers: Vec::new(),
+            peers: Vec::new(),
+            clients: Vec::new(),
+            version: 0,
+        }
+    }
+}
+
+impl<T> Routes<T> {
+    pub(crate) fn clear(&mut self) {
+        self.routers.clear();
+        self.peers.clear();
+        self.clients.clear();
+    }
+
     #[inline]
     pub(crate) fn get_route(
         &self,
+        version: RoutesVersion,
         whatami: WhatAmI,
         context: NodeId,
-    ) -> Option<Arc<QueryTargetQablSet>> {
-        match whatami {
-            WhatAmI::Router => (self.routers.len() > context as usize)
-                .then(|| self.routers[context as usize].clone()),
-            WhatAmI::Peer => {
-                (self.peers.len() > context as usize).then(|| self.peers[context as usize].clone())
-            }
-            WhatAmI::Client => (self.clients.len() > context as usize)
-                .then(|| self.clients[context as usize].clone()),
+    ) -> Option<&T> {
+        if version != self.version {
+            return None;
         }
+        let routes = match whatami {
+            WhatAmI::Router => &self.routers,
+            WhatAmI::Peer => &self.peers,
+            WhatAmI::Client => &self.clients,
+        };
+        routes.get(context as usize)?.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn set_route(
+        &mut self,
+        version: RoutesVersion,
+        whatami: WhatAmI,
+        context: NodeId,
+        route: T,
+    ) {
+        if self.version != version {
+            self.clear();
+            self.version = version;
+        }
+        let routes = match whatami {
+            WhatAmI::Router => &mut self.routers,
+            WhatAmI::Peer => &mut self.peers,
+            WhatAmI::Client => &mut self.clients,
+        };
+        routes.resize_with(context as usize + 1, || None);
+        routes[context as usize] = Some(route);
     }
 }
 
+pub(crate) fn get_or_set_route<T: Clone>(
+    routes: &RwLock<Routes<T>>,
+    version: RoutesVersion,
+    whatami: WhatAmI,
+    context: NodeId,
+    compute_route: impl FnOnce() -> T,
+) -> T {
+    if let Some(route) = routes.read().unwrap().get_route(version, whatami, context) {
+        return route.clone();
+    }
+    let mut routes = routes.write().unwrap();
+    if let Some(route) = routes.get_route(version, whatami, context) {
+        return route.clone();
+    }
+    let route = compute_route();
+    routes.set_route(version, whatami, context, route.clone());
+    route
+}
+
+pub(crate) type DataRoutes = Routes<Arc<Route>>;
+pub(crate) type QueryRoutes = Routes<Arc<QueryTargetQablSet>>;
+
 pub(crate) struct ResourceContext {
     pub(crate) matches: Vec<Weak<Resource>>,
-    pub(crate) matching_pulls: Option<Arc<PullCaches>>,
     pub(crate) hat: Box<dyn Any + Send + Sync>,
-    pub(crate) valid_data_routes: bool,
-    pub(crate) data_routes: DataRoutes,
-    pub(crate) valid_query_routes: bool,
-    pub(crate) query_routes: QueryRoutes,
+    pub(crate) data_routes: RwLock<DataRoutes>,
+    pub(crate) query_routes: RwLock<QueryRoutes>,
 }
 
 impl ResourceContext {
     fn new(hat: Box<dyn Any + Send + Sync>) -> ResourceContext {
         ResourceContext {
             matches: Vec::new(),
-            matching_pulls: None,
             hat,
-            valid_data_routes: false,
-            data_routes: DataRoutes::default(),
-            valid_query_routes: false,
-            query_routes: QueryRoutes::default(),
+            data_routes: Default::default(),
+            query_routes: Default::default(),
         }
     }
 
-    pub(crate) fn update_data_routes(&mut self, data_routes: DataRoutes) {
-        self.valid_data_routes = true;
-        self.data_routes = data_routes;
-    }
-
     pub(crate) fn disable_data_routes(&mut self) {
-        self.valid_data_routes = false;
-    }
-
-    pub(crate) fn update_query_routes(&mut self, query_routes: QueryRoutes) {
-        self.valid_query_routes = true;
-        self.query_routes = query_routes
+        self.data_routes.get_mut().unwrap().clear();
     }
 
     pub(crate) fn disable_query_routes(&mut self) {
-        self.valid_query_routes = false;
-    }
-
-    pub(crate) fn update_matching_pulls(&mut self, pulls: Arc<PullCaches>) {
-        self.matching_pulls = Some(pulls);
-    }
-
-    pub(crate) fn disable_matching_pulls(&mut self) {
-        self.matching_pulls = None;
+        self.query_routes.get_mut().unwrap().clear();
     }
 }
 
 pub struct Resource {
     pub(crate) parent: Option<Arc<Resource>>,
-    pub(crate) suffix: String,
-    pub(crate) nonwild_prefix: Option<(Arc<Resource>, String)>,
-    pub(crate) children: HashMap<String, Arc<Resource>>,
-    pub(crate) context: Option<ResourceContext>,
-    pub(crate) session_ctxs: HashMap<usize, Arc<SessionContext>>,
+    pub(crate) expr: String,
+    pub(crate) suffix: usize,
+    pub(crate) nonwild_prefix: Option<Arc<Resource>>,
+    pub(crate) children: SingleOrBoxHashSet<Child>,
+    pub(crate) context: Option<Box<ResourceContext>>,
+    pub(crate) session_ctxs: ahash::HashMap<usize, Arc<SessionContext>>,
 }
 
 impl PartialEq for Resource {
@@ -185,9 +246,50 @@ impl PartialEq for Resource {
 }
 impl Eq for Resource {}
 
+// NOTE: The `clippy::mutable_key_type` lint takes issue with the fact that `Resource` contains
+// interior mutable data. A configuration option is used to assert that the accessed fields are
+// not interior mutable in clippy.toml. Thus care should be taken to ensure soundness of this impl
+// as Clippy will not warn about its usage in sets/maps.
 impl Hash for Resource {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.expr().hash(state);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Child(Arc<Resource>);
+
+impl Deref for Child {
+    type Target = Arc<Resource>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PartialEq for Child {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.suffix() == other.0.suffix()
+    }
+}
+
+impl Eq for Child {}
+
+impl Hash for Child {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.suffix().hash(state);
+    }
+}
+
+impl Borrow<str> for Child {
+    fn borrow(&self) -> &str {
+        self.0.suffix()
     }
 }
 
@@ -196,29 +298,40 @@ impl Resource {
         let nonwild_prefix = match &parent.nonwild_prefix {
             None => {
                 if suffix.contains('*') {
-                    Some((parent.clone(), String::from(suffix)))
+                    Some(parent.clone())
                 } else {
                     None
                 }
             }
-            Some((prefix, wildsuffix)) => Some((prefix.clone(), [wildsuffix, suffix].concat())),
+            Some(prefix) => Some(prefix.clone()),
         };
 
         Resource {
             parent: Some(parent.clone()),
-            suffix: String::from(suffix),
+            expr: parent.expr.clone() + suffix,
+            suffix: parent.expr.len(),
             nonwild_prefix,
-            children: HashMap::new(),
-            context,
-            session_ctxs: HashMap::new(),
+            children: SingleOrBoxHashSet::new(),
+            context: context.map(Box::new),
+            session_ctxs: ahash::HashMap::new(),
         }
     }
 
-    pub fn expr(&self) -> String {
-        match &self.parent {
-            Some(parent) => parent.expr() + &self.suffix,
-            None => String::from(""),
+    pub fn expr(&self) -> &str {
+        &self.expr
+    }
+
+    pub fn keyexpr(&self) -> Option<&keyexpr> {
+        if self.parent.is_none() {
+            None
+        } else {
+            // SAFETY: non-root resources are valid keyexprs
+            unsafe { Some(keyexpr::from_str_unchecked(&self.expr)) }
         }
+    }
+
+    pub fn suffix(&self) -> &str {
+        &self.expr[self.suffix..]
     }
 
     #[inline(always)]
@@ -231,60 +344,41 @@ impl Resource {
         self.context.as_mut().unwrap()
     }
 
+    #[inline(always)]
+    pub(crate) fn matches(&self, other: &Arc<Resource>) -> bool {
+        self.context
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .any(|m| m.upgrade().is_some_and(|m| &m == other))
+    }
+
     pub fn nonwild_prefix(res: &Arc<Resource>) -> (Option<Arc<Resource>>, String) {
         match &res.nonwild_prefix {
             None => (Some(res.clone()), "".to_string()),
-            Some((nonwild_prefix, wildsuffix)) => {
+            Some(nonwild_prefix) => {
                 if !nonwild_prefix.expr().is_empty() {
-                    (Some(nonwild_prefix.clone()), wildsuffix.clone())
+                    (
+                        Some(nonwild_prefix.clone()),
+                        res.expr[nonwild_prefix.expr.len()..].to_string(),
+                    )
                 } else {
-                    (None, res.expr())
+                    (None, res.expr().to_string())
                 }
             }
-        }
-    }
-
-    #[inline]
-    pub(crate) fn data_route(&self, whatami: WhatAmI, context: NodeId) -> Option<Arc<Route>> {
-        match &self.context {
-            Some(ctx) => {
-                if ctx.valid_data_routes {
-                    ctx.data_routes.get_route(whatami, context)
-                } else {
-                    None
-                }
-            }
-
-            None => None,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn query_route(
-        &self,
-        whatami: WhatAmI,
-        context: NodeId,
-    ) -> Option<Arc<QueryTargetQablSet>> {
-        match &self.context {
-            Some(ctx) => {
-                if ctx.valid_query_routes {
-                    ctx.query_routes.get_route(whatami, context)
-                } else {
-                    None
-                }
-            }
-            None => None,
         }
     }
 
     pub fn root() -> Arc<Resource> {
         Arc::new(Resource {
             parent: None,
-            suffix: String::from(""),
+            expr: String::from(""),
+            suffix: 0,
             nonwild_prefix: None,
-            children: HashMap::new(),
+            children: SingleOrBoxHashSet::new(),
             context: None,
-            session_ctxs: HashMap::new(),
+            session_ctxs: ahash::HashMap::new(),
         })
     }
 
@@ -309,7 +403,7 @@ impl Resource {
                 }
                 mutres.nonwild_prefix.take();
                 {
-                    get_mut_unchecked(parent).children.remove(&res.suffix);
+                    get_mut_unchecked(parent).children.remove(res.suffix());
                 }
                 Resource::clean(parent);
             }
@@ -318,20 +412,20 @@ impl Resource {
 
     pub fn close(self: &mut Arc<Resource>) {
         let r = get_mut_unchecked(self);
-        for c in r.children.values_mut() {
-            Self::close(c);
+        for mut c in r.children.drain() {
+            Self::close(&mut c);
         }
         r.parent.take();
-        r.children.clear();
         r.nonwild_prefix.take();
+        r.context.take();
         r.session_ctxs.clear();
     }
 
     #[cfg(test)]
     pub fn print_tree(from: &Arc<Resource>) -> String {
-        let mut result = from.expr();
+        let mut result = from.expr().to_string();
         result.push('\n');
-        for child in from.children.values() {
+        for child in from.children.iter() {
             result.push_str(&Resource::print_tree(child));
         }
         result
@@ -340,159 +434,125 @@ impl Resource {
     pub fn make_resource(
         tables: &mut Tables,
         from: &mut Arc<Resource>,
-        suffix: &str,
+        mut suffix: &str,
     ) -> Arc<Resource> {
-        if suffix.is_empty() {
-            Resource::upgrade_resource(from, tables.hat_code.new_resource());
-            from.clone()
-        } else if let Some(stripped_suffix) = suffix.strip_prefix('/') {
-            let (chunk, rest) = match stripped_suffix.find('/') {
-                Some(idx) => (&suffix[0..(idx + 1)], &suffix[(idx + 1)..]),
-                None => (suffix, ""),
-            };
-
-            match get_mut_unchecked(from).children.get_mut(chunk) {
-                Some(res) => Resource::make_resource(tables, res, rest),
-                None => {
-                    let mut new = Arc::new(Resource::new(from, chunk, None));
-                    if tracing::enabled!(tracing::Level::DEBUG) && rest.is_empty() {
-                        tracing::debug!("Register resource {}", new.expr());
-                    }
-                    let res = Resource::make_resource(tables, &mut new, rest);
-                    get_mut_unchecked(from)
-                        .children
-                        .insert(String::from(chunk), new);
-                    res
-                }
-            }
-        } else {
-            match from.parent.clone() {
-                Some(mut parent) => {
-                    Resource::make_resource(tables, &mut parent, &[&from.suffix, suffix].concat())
-                }
-                None => {
-                    let (chunk, rest) = match suffix[1..].find('/') {
-                        Some(idx) => (&suffix[0..(idx + 1)], &suffix[(idx + 1)..]),
-                        None => (suffix, ""),
-                    };
-
-                    match get_mut_unchecked(from).children.get_mut(chunk) {
-                        Some(res) => Resource::make_resource(tables, res, rest),
-                        None => {
-                            let mut new = Arc::new(Resource::new(from, chunk, None));
-                            if tracing::enabled!(tracing::Level::DEBUG) && rest.is_empty() {
-                                tracing::debug!("Register resource {}", new.expr());
-                            }
-                            let res = Resource::make_resource(tables, &mut new, rest);
-                            get_mut_unchecked(from)
-                                .children
-                                .insert(String::from(chunk), new);
-                            res
-                        }
-                    }
-                }
+        if !suffix.is_empty() && !suffix.starts_with('/') {
+            if let Some(parent) = &mut from.parent.clone() {
+                return Resource::make_resource(tables, parent, &[from.suffix(), suffix].concat());
             }
         }
+        let mut from = from.clone();
+        // do not use recursion as the tree may have arbitrary depth
+        while let Some((chunk, rest)) = Self::split_first_chunk(suffix) {
+            if let Some(child) = get_mut_unchecked(&mut from).children.get(chunk) {
+                from = child.0.clone();
+            } else {
+                let new = Arc::new(Resource::new(&from, chunk, None));
+                if rest.is_empty() {
+                    tracing::debug!("Register resource {}", new.expr());
+                }
+                get_mut_unchecked(&mut from)
+                    .children
+                    .insert(Child(new.clone()));
+                from = new;
+            };
+            suffix = rest;
+        }
+        Resource::upgrade_resource(&mut from, tables.hat_code.new_resource());
+        from
     }
 
     #[inline]
-    pub fn get_resource(from: &Arc<Resource>, suffix: &str) -> Option<Arc<Resource>> {
-        if suffix.is_empty() {
-            Some(from.clone())
-        } else if let Some(stripped_suffix) = suffix.strip_prefix('/') {
-            let (chunk, rest) = match stripped_suffix.find('/') {
-                Some(idx) => (&suffix[0..(idx + 1)], &suffix[(idx + 1)..]),
-                None => (suffix, ""),
-            };
-
-            match from.children.get(chunk) {
-                Some(res) => Resource::get_resource(res, rest),
-                None => None,
-            }
-        } else {
-            match &from.parent {
-                Some(parent) => Resource::get_resource(parent, &[&from.suffix, suffix].concat()),
-                None => {
-                    let (chunk, rest) = match suffix[1..].find('/') {
-                        Some(idx) => (&suffix[0..(idx + 1)], &suffix[(idx + 1)..]),
-                        None => (suffix, ""),
-                    };
-
-                    match from.children.get(chunk) {
-                        Some(res) => Resource::get_resource(res, rest),
-                        None => None,
-                    }
-                }
+    pub fn get_resource(mut from: &Arc<Resource>, mut suffix: &str) -> Option<Arc<Resource>> {
+        if !suffix.is_empty() && !suffix.starts_with('/') {
+            if let Some(parent) = &from.parent {
+                return Resource::get_resource(parent, &[from.suffix(), suffix].concat());
             }
         }
+        // do not use recursion as the tree may have arbitrary depth
+        while let Some((chunk, rest)) = Self::split_first_chunk(suffix) {
+            (from, suffix) = (from.children.get(chunk)?, rest);
+        }
+        Some(from.clone())
     }
 
-    fn fst_chunk(key_expr: &keyexpr) -> (&keyexpr, Option<&keyexpr>) {
-        match key_expr.as_bytes().iter().position(|c| *c == b'/') {
-            Some(pos) => {
-                let left = &key_expr.as_bytes()[..pos];
-                let right = &key_expr.as_bytes()[pos + 1..];
-                unsafe {
-                    (
-                        keyexpr::from_slice_unchecked(left),
-                        Some(keyexpr::from_slice_unchecked(right)),
-                    )
-                }
-            }
-            None => (key_expr, None),
+    /// Split the suffix at the next '/' (after leading one), returning None if the suffix is empty.
+    ///
+    /// Suffix usually starts with '/', so this first slash is kept as part of the split chunk.
+    /// The rest will contain the slash of the split.
+    /// For example `split_first_chunk("/a/b") == Some(("/a", "/b"))`.
+    fn split_first_chunk(suffix: &str) -> Option<(&str, &str)> {
+        if suffix.is_empty() {
+            return None;
         }
+        // don't count the first char which may be a leading slash to find the next one
+        Some(match suffix[1..].find('/') {
+            // don't forget to add 1 to the index because of `[1..]` slice above
+            Some(idx) => suffix.split_at(idx + 1),
+            None => (suffix, ""),
+        })
     }
 
     #[inline]
-    pub fn decl_key(res: &Arc<Resource>, face: &mut Arc<FaceState>) -> WireExpr<'static> {
+    pub fn decl_key(
+        res: &Arc<Resource>,
+        face: &mut Arc<FaceState>,
+        push: bool,
+    ) -> WireExpr<'static> {
+        if face.is_local {
+            return res.expr().to_string().into();
+        }
+
         let (nonwild_prefix, wildsuffix) = Resource::nonwild_prefix(res);
         match nonwild_prefix {
             Some(mut nonwild_prefix) => {
-                let ctx = get_mut_unchecked(&mut nonwild_prefix)
+                if let Some(ctx) = get_mut_unchecked(&mut nonwild_prefix)
                     .session_ctxs
-                    .entry(face.id)
-                    .or_insert_with(|| {
-                        Arc::new(SessionContext {
-                            face: face.clone(),
-                            local_expr_id: None,
-                            remote_expr_id: None,
-                            subs: None,
-                            qabl: None,
-                            last_values: HashMap::new(),
-                            in_interceptor_cache: None,
-                            e_interceptor_cache: None,
-                        })
-                    });
-
-                if let Some(expr_id) = ctx.remote_expr_id {
-                    WireExpr {
-                        scope: expr_id,
-                        suffix: wildsuffix.into(),
-                        mapping: Mapping::Receiver,
+                    .get(&face.id)
+                {
+                    if let Some(expr_id) = ctx.remote_expr_id {
+                        return WireExpr {
+                            scope: expr_id,
+                            suffix: wildsuffix.into(),
+                            mapping: Mapping::Receiver,
+                        };
                     }
-                } else if let Some(expr_id) = ctx.local_expr_id {
-                    WireExpr {
-                        scope: expr_id,
-                        suffix: wildsuffix.into(),
-                        mapping: Mapping::Sender,
+                    if let Some(expr_id) = ctx.local_expr_id {
+                        return WireExpr {
+                            scope: expr_id,
+                            suffix: wildsuffix.into(),
+                            mapping: Mapping::Sender,
+                        };
                     }
-                } else {
+                }
+                if push
+                    || face.remote_key_interests.values().any(|res| {
+                        res.as_ref()
+                            .map(|res| res.matches(&nonwild_prefix))
+                            .unwrap_or(true)
+                    })
+                {
+                    let ctx = get_mut_unchecked(&mut nonwild_prefix)
+                        .session_ctxs
+                        .entry(face.id)
+                        .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
                     let expr_id = face.get_next_local_id();
                     get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
                     get_mut_unchecked(face)
                         .local_mappings
                         .insert(expr_id, nonwild_prefix.clone());
                     face.primitives.send_declare(RoutingContext::with_expr(
-                        Declare {
-                            ext_qos: ext::QoSType::declare_default(),
+                        &mut Declare {
+                            interest_id: None,
+                            ext_qos: ext::QoSType::DECLARE,
                             ext_tstamp: None,
-                            ext_nodeid: ext::NodeIdType::default(),
+                            ext_nodeid: ext::NodeIdType::DEFAULT,
                             body: DeclareBody::DeclareKeyExpr(DeclareKeyExpr {
                                 id: expr_id,
-                                wire_expr: nonwild_prefix.expr().into(),
+                                wire_expr: nonwild_prefix.expr().to_string().into(),
                             }),
                         },
-                        nonwild_prefix.expr(),
+                        nonwild_prefix.expr().to_string(),
                     ));
                     face.update_interceptors_caches(&mut nonwild_prefix);
                     WireExpr {
@@ -500,133 +560,183 @@ impl Resource {
                         suffix: wildsuffix.into(),
                         mapping: Mapping::Sender,
                     }
+                } else {
+                    res.expr().to_string().into()
                 }
             }
             None => wildsuffix.into(),
         }
     }
 
-    #[inline]
-    pub fn get_best_key<'a>(prefix: &Arc<Resource>, suffix: &'a str, sid: usize) -> WireExpr<'a> {
-        fn get_best_key_<'a>(
-            prefix: &Arc<Resource>,
+    /// Return the best locally/remotely declared keyexpr, i.e. with the smallest suffix, matching
+    /// the given suffix and session id.
+    ///
+    /// The goal is to save bandwidth by using the shortest keyexpr on the wire. It works by
+    /// recursively walk through the children tree, looking for an already declared keyexpr for the
+    /// session.
+    /// If none is found, and if the tested resource itself doesn't have a declared keyexpr,
+    /// then the parent tree is walked through. If there is still no declared keyexpr, the whole
+    /// prefix+suffix string is used.
+    pub fn get_best_key<'a>(&self, suffix: &'a str, sid: usize) -> WireExpr<'a> {
+        /// Retrieve a declared keyexpr, either local or remote.
+        fn get_wire_expr<'a>(
+            prefix: &Resource,
+            suffix: impl FnOnce() -> Cow<'a, str>,
+            sid: usize,
+        ) -> Option<WireExpr<'a>> {
+            let ctx = prefix.session_ctxs.get(&sid)?;
+            let (scope, mapping) = match (ctx.remote_expr_id, ctx.local_expr_id) {
+                (Some(expr_id), _) => (expr_id, Mapping::Receiver),
+                (_, Some(expr_id)) => (expr_id, Mapping::Sender),
+                _ => return None,
+            };
+            Some(WireExpr {
+                scope,
+                suffix: suffix(),
+                mapping,
+            })
+        }
+        /// Walk through the children tree, looking for a declared keyexpr.
+        fn get_best_child_key<'a>(
+            mut prefix: &Resource,
             suffix: &'a str,
             sid: usize,
-            checkchilds: bool,
-        ) -> WireExpr<'a> {
-            if checkchilds && !suffix.is_empty() {
-                let (chunk, rest) = suffix.split_at(suffix.find('/').unwrap_or(suffix.len()));
-                if let Some(child) = prefix.children.get(chunk) {
-                    return get_best_key_(child, rest, sid, true);
+        ) -> Option<WireExpr<'a>> {
+            let mut suffix_rest = suffix;
+            // do not use recursion as the tree may have arbitrary depth
+            // first we get the closest matching child
+            while let Some((chunk, rest)) = Resource::split_first_chunk(suffix_rest) {
+                match prefix.children.get(chunk) {
+                    Some(child) => prefix = child,
+                    None => break,
                 }
+                suffix_rest = rest;
             }
-            if let Some(ctx) = prefix.session_ctxs.get(&sid) {
-                if let Some(expr_id) = ctx.remote_expr_id {
-                    return WireExpr {
-                        scope: expr_id,
-                        suffix: suffix.into(),
-                        mapping: Mapping::Receiver,
-                    };
-                } else if let Some(expr_id) = ctx.local_expr_id {
-                    return WireExpr {
-                        scope: expr_id,
-                        suffix: suffix.into(),
-                        mapping: Mapping::Sender,
-                    };
+            // then we go backward checking the child and its parents
+            while suffix_rest != suffix {
+                if let Some(wire_expr) = get_wire_expr(prefix, || suffix_rest.into(), sid) {
+                    return Some(wire_expr);
                 }
+                suffix_rest = &suffix[suffix.len() - suffix_rest.len() - prefix.suffix().len()..];
+                prefix = prefix.parent.as_ref().unwrap();
             }
-            match &prefix.parent {
-                Some(parent) => {
-                    get_best_key_(parent, &[&prefix.suffix, suffix].concat(), sid, false).to_owned()
+            None
+        }
+        /// Walk through the parent tree, looking for a declared keyexpr.
+        fn get_best_parent_key<'a>(
+            prefix: &Resource,
+            suffix: &'a str,
+            sid: usize,
+            mut parent: &Resource,
+        ) -> Option<WireExpr<'a>> {
+            // do not use recursion as the tree may have arbitrary depth
+            loop {
+                let parent_suffix = || [&prefix.expr[parent.expr.len()..], suffix].concat().into();
+                if let Some(wire_expr) = get_wire_expr(parent, parent_suffix, sid) {
+                    return Some(wire_expr);
                 }
-                None => suffix.into(),
+                match parent.parent.as_ref() {
+                    Some(p) => parent = p,
+                    None => return None,
+                }
             }
         }
-        get_best_key_(prefix, suffix, sid, true)
+        get_best_child_key(self, suffix, sid)
+            .or_else(|| get_wire_expr(self, || suffix.into(), sid))
+            .or_else(|| get_best_parent_key(self, suffix, sid, self.parent.as_ref()?))
+            .unwrap_or_else(|| [&self.expr, suffix].concat().into())
     }
 
     pub fn get_matches(tables: &Tables, key_expr: &keyexpr) -> Vec<Weak<Resource>> {
-        fn recursive_push(from: &Arc<Resource>, matches: &mut Vec<Weak<Resource>>) {
-            if from.context.is_some() {
-                matches.push(Arc::downgrade(from));
+        pub fn visit_nodes<T>(node: T, mut visit: impl FnMut(T, &mut VecDeque<T>)) {
+            let mut nodes = VecDeque::from([node]);
+            while let Some(node) = nodes.pop_front() {
+                visit(node, &mut nodes);
             }
-            for child in from.children.values() {
-                recursive_push(child, matches)
-            }
+        }
+        fn push_all(from: &Arc<Resource>, matches: &mut Vec<Weak<Resource>>) {
+            visit_nodes(from, |from, nodes| {
+                if from.context.is_some() {
+                    matches.push(Arc::downgrade(from));
+                }
+                for child in from.children.iter() {
+                    nodes.push_back(child);
+                }
+            });
         }
         fn get_matches_from(
             key_expr: &keyexpr,
             from: &Arc<Resource>,
             matches: &mut Vec<Weak<Resource>>,
         ) {
-            if from.parent.is_none() || from.suffix == "/" {
-                for child in from.children.values() {
-                    get_matches_from(key_expr, child, matches);
+            visit_nodes((key_expr, from), |(key_expr, from), nodes| {
+                if from.parent.is_none() || from.suffix() == "/" {
+                    for child in from.children.iter() {
+                        nodes.push_back((key_expr, child));
+                    }
+                    return;
                 }
-                return;
-            }
-            let suffix: &keyexpr = from
-                .suffix
-                .strip_prefix('/')
-                .unwrap_or(&from.suffix)
-                .try_into()
-                .unwrap();
-            let (chunk, rest) = Resource::fst_chunk(key_expr);
-            if chunk.intersects(suffix) {
-                match rest {
-                    None => {
-                        if chunk.as_bytes() == b"**" {
-                            recursive_push(from, matches)
-                        } else {
-                            if from.context.is_some() {
-                                matches.push(Arc::downgrade(from));
-                            }
-                            if suffix.as_bytes() == b"**" {
-                                for child in from.children.values() {
-                                    get_matches_from(key_expr, child, matches)
-                                }
-                            }
-                            if let Some(child) =
-                                from.children.get("/**").or_else(|| from.children.get("**"))
-                            {
-                                if child.context.is_some() {
-                                    matches.push(Arc::downgrade(child))
-                                }
-                            }
-                        }
-                    }
-                    Some(rest) if rest.as_bytes() == b"**" => recursive_push(from, matches),
-                    Some(rest) => {
-                        let recheck_keyexpr_one_level_lower =
-                            chunk.as_bytes() == b"**" || suffix.as_bytes() == b"**";
-                        for child in from.children.values() {
-                            get_matches_from(rest, child, matches);
-                            if recheck_keyexpr_one_level_lower {
-                                get_matches_from(key_expr, child, matches)
-                            }
-                        }
-                        if recheck_keyexpr_one_level_lower {
-                            get_matches_from(rest, from, matches)
-                        }
-                    }
+                let suffix: &keyexpr = from
+                    .suffix()
+                    .strip_prefix('/')
+                    .unwrap_or(from.suffix())
+                    .try_into()
+                    .unwrap();
+                let (ke_chunk, ke_rest) = match key_expr.split_once('/') {
+                    // SAFETY: chunks of keyexpr are valid keyexprs
+                    Some((chunk, rest)) => unsafe {
+                        (
+                            keyexpr::from_str_unchecked(chunk),
+                            Some(keyexpr::from_str_unchecked(rest)),
+                        )
+                    },
+                    None => (key_expr, None),
                 };
-            }
+                if ke_chunk.intersects(suffix) {
+                    match ke_rest {
+                        None => {
+                            if ke_chunk.as_bytes() == b"**" {
+                                push_all(from, matches)
+                            } else {
+                                if from.context.is_some() {
+                                    matches.push(Arc::downgrade(from));
+                                }
+                                if suffix.as_bytes() == b"**" {
+                                    for child in from.children.iter() {
+                                        nodes.push_back((key_expr, child));
+                                    }
+                                }
+                                if let Some(child) =
+                                    from.children.get("/**").or_else(|| from.children.get("**"))
+                                {
+                                    if child.context.is_some() {
+                                        matches.push(Arc::downgrade(child))
+                                    }
+                                }
+                            }
+                        }
+                        Some(rest) if rest.as_bytes() == b"**" => push_all(from, matches),
+                        Some(rest) => {
+                            let recheck_keyexpr_one_level_lower =
+                                ke_chunk.as_bytes() == b"**" || suffix.as_bytes() == b"**";
+                            for child in from.children.iter() {
+                                nodes.push_back((rest, child));
+                                if recheck_keyexpr_one_level_lower {
+                                    nodes.push_back((key_expr, child));
+                                }
+                            }
+                            if recheck_keyexpr_one_level_lower {
+                                nodes.push_back((rest, from));
+                            }
+                        }
+                    };
+                }
+            })
         }
         let mut matches = Vec::new();
         get_matches_from(key_expr, &tables.root_res, &mut matches);
-        let mut i = 0;
-        while i < matches.len() {
-            let current = matches[i].as_ptr();
-            let mut j = i + 1;
-            while j < matches.len() {
-                if std::ptr::eq(current, matches[j].as_ptr()) {
-                    matches.swap_remove(j);
-                } else {
-                    j += 1
-                }
-            }
-            i += 1
-        }
+        matches.sort_unstable_by_key(Weak::as_ptr);
+        matches.dedup_by_key(|res| Weak::as_ptr(res));
         matches
     }
 
@@ -647,24 +757,32 @@ impl Resource {
 
     pub fn upgrade_resource(res: &mut Arc<Resource>, hat: Box<dyn Any + Send + Sync>) {
         if res.context.is_none() {
-            get_mut_unchecked(res).context = Some(ResourceContext::new(hat));
+            get_mut_unchecked(res).context = Some(Box::new(ResourceContext::new(hat)));
         }
     }
 
-    pub(crate) fn get_ingress_cache(&self, face: &Face) -> Option<&Box<dyn Any + Send + Sync>> {
+    pub(crate) fn get_ingress_cache(
+        &self,
+        face: &Face,
+        interceptor: &InterceptorsChain,
+    ) -> Option<InterceptorCacheValueType> {
         self.session_ctxs
             .get(&face.state.id)
-            .and_then(|ctx| ctx.in_interceptor_cache.as_ref())
+            .and_then(|ctx| ctx.in_interceptor_cache.value(interceptor, self))
     }
 
-    pub(crate) fn get_egress_cache(&self, face: &Face) -> Option<&Box<dyn Any + Send + Sync>> {
+    pub(crate) fn get_egress_cache(
+        &self,
+        face: &Face,
+        interceptor: &InterceptorsChain,
+    ) -> Option<InterceptorCacheValueType> {
         self.session_ctxs
             .get(&face.state.id)
-            .and_then(|ctx| ctx.e_interceptor_cache.as_ref())
+            .and_then(|ctx| ctx.e_interceptor_cache.value(interceptor, self))
     }
 }
 
-pub fn register_expr(
+pub(crate) fn register_expr(
     tables: &TablesLock,
     face: &mut Arc<FaceState>,
     expr_id: ExprId,
@@ -677,10 +795,14 @@ pub fn register_expr(
     {
         Some(mut prefix) => match face.remote_mappings.get(&expr_id) {
             Some(res) => {
-                let mut fullexpr = prefix.expr();
+                let mut fullexpr = prefix.expr().to_string();
                 fullexpr.push_str(expr.suffix.as_ref());
                 if res.expr() != fullexpr {
-                    tracing::error!("Resource {} remapped. Remapping unsupported!", expr_id);
+                    tracing::error!(
+                        "{} Resource {} remapped. Remapping unsupported!",
+                        face,
+                        expr_id
+                    );
                 }
             }
             None => {
@@ -694,7 +816,7 @@ pub fn register_expr(
                     let wtables = zwrite!(tables.tables);
                     (res.unwrap(), wtables)
                 } else {
-                    let mut fullexpr = prefix.expr();
+                    let mut fullexpr = prefix.expr().to_string();
                     fullexpr.push_str(expr.suffix.as_ref());
                     let mut matches = keyexpr::new(fullexpr.as_str())
                         .map(|ke| Resource::get_matches(&rtables, ke))
@@ -707,39 +829,97 @@ pub fn register_expr(
                     Resource::match_resource(&wtables, &mut res, matches);
                     (res, wtables)
                 };
-                get_mut_unchecked(&mut res)
+                let ctx = get_mut_unchecked(&mut res)
                     .session_ctxs
                     .entry(face.id)
-                    .or_insert_with(|| {
-                        Arc::new(SessionContext {
-                            face: face.clone(),
-                            local_expr_id: None,
-                            remote_expr_id: Some(expr_id),
-                            subs: None,
-                            qabl: None,
-                            last_values: HashMap::new(),
-                            in_interceptor_cache: None,
-                            e_interceptor_cache: None,
-                        })
-                    });
+                    .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
+
+                get_mut_unchecked(ctx).remote_expr_id = Some(expr_id);
 
                 get_mut_unchecked(face)
                     .remote_mappings
                     .insert(expr_id, res.clone());
-                wtables.update_matches_routes(&mut res);
+                disable_matches_data_routes(&mut wtables, &mut res);
+                disable_matches_query_routes(&mut wtables, &mut res);
                 face.update_interceptors_caches(&mut res);
                 drop(wtables);
             }
         },
-        None => tracing::error!("Declare resource with unknown scope {}!", expr.scope),
+        None => tracing::error!(
+            "{} Declare resource with unknown scope {}!",
+            face,
+            expr.scope
+        ),
     }
 }
 
-pub fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, expr_id: ExprId) {
+pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, expr_id: ExprId) {
     let wtables = zwrite!(tables.tables);
     match get_mut_unchecked(face).remote_mappings.remove(&expr_id) {
         Some(mut res) => Resource::clean(&mut res),
-        None => tracing::error!("Undeclare unknown resource!"),
+        None => tracing::error!("{} Undeclare unknown resource!", face),
     }
+    drop(wtables);
+}
+
+pub(crate) fn register_expr_interest(
+    tables: &TablesLock,
+    face: &mut Arc<FaceState>,
+    id: InterestId,
+    expr: Option<&WireExpr>,
+) {
+    if let Some(expr) = expr {
+        let rtables = zread!(tables.tables);
+        match rtables
+            .get_mapping(face, &expr.scope, expr.mapping)
+            .cloned()
+        {
+            Some(mut prefix) => {
+                let res = Resource::get_resource(&prefix, &expr.suffix);
+                let (res, wtables) = if res.as_ref().map(|r| r.context.is_some()).unwrap_or(false) {
+                    drop(rtables);
+                    let wtables = zwrite!(tables.tables);
+                    (res.unwrap(), wtables)
+                } else {
+                    let mut fullexpr = prefix.expr().to_string();
+                    fullexpr.push_str(expr.suffix.as_ref());
+                    let mut matches = keyexpr::new(fullexpr.as_str())
+                        .map(|ke| Resource::get_matches(&rtables, ke))
+                        .unwrap_or_default();
+                    drop(rtables);
+                    let mut wtables = zwrite!(tables.tables);
+                    let mut res =
+                        Resource::make_resource(&mut wtables, &mut prefix, expr.suffix.as_ref());
+                    matches.push(Arc::downgrade(&res));
+                    Resource::match_resource(&wtables, &mut res, matches);
+                    (res, wtables)
+                };
+                get_mut_unchecked(face)
+                    .remote_key_interests
+                    .insert(id, Some(res));
+                drop(wtables);
+            }
+            None => tracing::error!(
+                "{} Declare keyexpr interest with unknown scope {}!",
+                face,
+                expr.scope,
+            ),
+        }
+    } else {
+        let wtables = zwrite!(tables.tables);
+        get_mut_unchecked(face)
+            .remote_key_interests
+            .insert(id, None);
+        drop(wtables);
+    }
+}
+
+pub(crate) fn unregister_expr_interest(
+    tables: &TablesLock,
+    face: &mut Arc<FaceState>,
+    id: InterestId,
+) {
+    let wtables = zwrite!(tables.tables);
+    get_mut_unchecked(face).remote_key_interests.remove(&id);
     drop(wtables);
 }

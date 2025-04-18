@@ -11,33 +11,31 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::dispatcher::face::{Face, FaceState};
-pub use super::dispatcher::pubsub::*;
-pub use super::dispatcher::queries::*;
-pub use super::dispatcher::resource::*;
-use super::dispatcher::tables::Tables;
-use super::dispatcher::tables::TablesLock;
-use super::hat;
-use super::interceptor::EgressInterceptor;
-use super::interceptor::InterceptorsChain;
-use super::runtime::Runtime;
-use crate::net::primitives::DeMux;
-use crate::net::primitives::DummyPrimitives;
-use crate::net::primitives::EPrimitives;
-use crate::net::primitives::McastMux;
-use crate::net::primitives::Mux;
-use crate::net::routing::interceptor::IngressInterceptor;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::{Mutex, RwLock};
+use std::{
+    str::FromStr,
+    sync::{atomic::Ordering, Arc, Mutex, RwLock},
+};
+
+use arc_swap::ArcSwap;
 use uhlc::HLC;
 use zenoh_config::Config;
-use zenoh_protocol::core::{WhatAmI, ZenohId};
-use zenoh_transport::multicast::TransportMulticast;
-use zenoh_transport::unicast::TransportUnicast;
-use zenoh_transport::TransportPeer;
+use zenoh_protocol::core::{WhatAmI, ZenohIdProto};
 // use zenoh_collections::Timer;
 use zenoh_result::ZResult;
+use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast, TransportPeer};
+
+pub(crate) use super::dispatcher::token::*;
+pub use super::dispatcher::{pubsub::*, queries::*, resource::*};
+use super::{
+    dispatcher::{
+        face::{Face, FaceState},
+        tables::{Tables, TablesLock},
+    },
+    hat,
+    interceptor::InterceptorsChain,
+    runtime::Runtime,
+};
+use crate::net::primitives::{DeMux, DummyPrimitives, EPrimitives, McastMux, Mux};
 
 pub struct Router {
     // whatami: WhatAmI,
@@ -46,7 +44,7 @@ pub struct Router {
 
 impl Router {
     pub fn new(
-        zid: ZenohId,
+        zid: ZenohIdProto,
         whatami: WhatAmI,
         hlc: Option<Arc<HLC>>,
         config: &Config,
@@ -61,10 +59,10 @@ impl Router {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn init_link_state(&mut self, runtime: Runtime) {
+    pub fn init_link_state(&mut self, runtime: Runtime) -> ZResult<()> {
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
         let mut tables = zwrite!(self.tables.tables);
+        tables.runtime = Some(Runtime::downgrade(&runtime));
         ctrl_lock.init(&mut tables, runtime)
     }
 
@@ -92,6 +90,7 @@ impl Router {
                     None,
                     None,
                     ctrl_lock.new_face(),
+                    true,
                 )
             })
             .clone();
@@ -110,7 +109,7 @@ impl Router {
         drop(tables);
         drop(ctrl_lock);
         for (p, m) in declares {
-            p.send_declare(m);
+            m.with_mut(|m| p.send_declare(m));
         }
         Arc::new(face)
     }
@@ -125,18 +124,9 @@ impl Router {
         let zid = transport.get_zid()?;
         #[cfg(feature = "stats")]
         let stats = transport.get_stats()?;
-        let (ingress, egress): (Vec<_>, Vec<_>) = tables
-            .interceptors
-            .iter()
-            .map(|itor| itor.new_transport_unicast(&transport))
-            .unzip();
-        let (ingress, egress) = (
-            Arc::new(InterceptorsChain::from(
-                ingress.into_iter().flatten().collect::<Vec<_>>(),
-            )),
-            InterceptorsChain::from(egress.into_iter().flatten().collect::<Vec<_>>()),
-        );
-        let mux = Arc::new(Mux::new(transport.clone(), egress));
+
+        let ingress = Arc::new(ArcSwap::new(InterceptorsChain::empty().into()));
+        let mux = Arc::new(Mux::new(transport.clone(), InterceptorsChain::empty()));
         let newface = tables
             .faces
             .entry(fid)
@@ -151,9 +141,14 @@ impl Router {
                     None,
                     Some(ingress.clone()),
                     ctrl_lock.new_face(),
+                    false,
                 )
             })
             .clone();
+        newface.set_interceptors_from_factories(
+            &tables.interceptors,
+            tables.next_interceptor_version.load(Ordering::SeqCst),
+        );
         tracing::debug!("New {}", newface);
 
         let mut face = Face {
@@ -174,7 +169,7 @@ impl Router {
         drop(tables);
         drop(ctrl_lock);
         for (p, m) in declares {
-            p.send_declare(m);
+            m.with_mut(|m| p.send_declare(m));
         }
 
         Ok(Arc::new(DeMux::new(face, Some(transport), ingress)))
@@ -185,17 +180,10 @@ impl Router {
         let mut tables = zwrite!(self.tables.tables);
         let fid = tables.face_counter;
         tables.face_counter += 1;
-        let interceptor = InterceptorsChain::from(
-            tables
-                .interceptors
-                .iter()
-                .filter_map(|itor| itor.new_transport_multicast(&transport))
-                .collect::<Vec<EgressInterceptor>>(),
-        );
-        let mux = Arc::new(McastMux::new(transport.clone(), interceptor));
+        let mux = Arc::new(McastMux::new(transport.clone(), InterceptorsChain::empty()));
         let face = FaceState::new(
             fid,
-            ZenohId::from_str("1").unwrap(),
+            ZenohIdProto::from_str("1").unwrap(),
             WhatAmI::Peer,
             #[cfg(feature = "stats")]
             None,
@@ -203,6 +191,11 @@ impl Router {
             Some(transport),
             None,
             ctrl_lock.new_face(),
+            false,
+        );
+        face.set_interceptors_from_factories(
+            &tables.interceptors,
+            tables.next_interceptor_version.load(Ordering::SeqCst),
         );
         let _ = mux.face.set(Face {
             state: face.clone(),
@@ -210,9 +203,7 @@ impl Router {
         });
         tables.mcast_groups.push(face);
 
-        // recompute routes
-        let mut root_res = tables.root_res.clone();
-        update_data_routes_from(&mut tables, &mut root_res);
+        tables.disable_all_routes();
         Ok(())
     }
 
@@ -225,13 +216,7 @@ impl Router {
         let mut tables = zwrite!(self.tables.tables);
         let fid = tables.face_counter;
         tables.face_counter += 1;
-        let interceptor = Arc::new(InterceptorsChain::from(
-            tables
-                .interceptors
-                .iter()
-                .filter_map(|itor| itor.new_peer_multicast(&transport))
-                .collect::<Vec<IngressInterceptor>>(),
-        ));
+        let interceptor = Arc::new(ArcSwap::new(InterceptorsChain::empty().into()));
         let face_state = FaceState::new(
             fid,
             peer.zid,
@@ -242,12 +227,15 @@ impl Router {
             Some(transport),
             Some(interceptor.clone()),
             ctrl_lock.new_face(),
+            false,
+        );
+        face_state.set_interceptors_from_factories(
+            &tables.interceptors,
+            tables.next_interceptor_version.load(Ordering::SeqCst),
         );
         tables.mcast_faces.push(face_state.clone());
 
-        // recompute routes
-        let mut root_res = tables.root_res.clone();
-        update_data_routes_from(&mut tables, &mut root_res);
+        tables.disable_all_routes();
         Ok(Arc::new(DeMux::new(
             Face {
                 tables: self.tables.clone(),

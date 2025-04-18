@@ -15,6 +15,7 @@ use core::{
     convert::TryFrom,
     fmt::{self, Debug},
 };
+
 use zenoh_buffers::ZBuf;
 
 /// # Zenoh extensions
@@ -306,8 +307,9 @@ impl<const ID: u8> Debug for ZExtZBufHeader<{ ID }> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum ZExtBody {
+    #[default]
     Unit,
     Z64(u64),
     ZBuf(ZBuf),

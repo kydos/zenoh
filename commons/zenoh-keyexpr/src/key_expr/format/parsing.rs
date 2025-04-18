@@ -221,7 +221,7 @@ fn do_parse<'a>(
                 }
             }
             pattern.is_double_wild()
-                && prefix.map_or(false, |prefix| prefix.intersects(target))
+                && prefix.is_some_and(|prefix| prefix.intersects(target))
                 && do_parse(None, segments, results)
         }
         _ => unreachable!(),
@@ -230,8 +230,9 @@ fn do_parse<'a>(
 
 #[test]
 fn parsing() {
-    use crate::key_expr::OwnedKeyExpr;
     use core::convert::TryFrom;
+
+    use crate::key_expr::OwnedKeyExpr;
     for a_spec in ["${a:*}", "a/${a:*}"] {
         for b_spec in ["b/${b:**}", "${b:**}"] {
             let specs = [a_spec, b_spec, "c"];

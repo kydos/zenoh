@@ -16,25 +16,43 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+
+use nonempty_collections::NEVec;
+use zenoh_config::{DownsamplingItemConf, DownsamplingMessage, DownsamplingRuleConf};
+use zenoh_core::zlock;
+use zenoh_keyexpr::keyexpr_tree::{
+    impls::KeyedSetProvider, support::UnknownWildness, IKeyExprTree, IKeyExprTreeMut, KeBoxTree,
+};
+use zenoh_protocol::network::NetworkBodyMut;
+use zenoh_result::ZResult;
+#[cfg(feature = "stats")]
+use zenoh_transport::stats::TransportStats;
 
 use crate::net::routing::interceptor::*;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use zenoh_config::{DownsamplingItemConf, DownsamplingRuleConf, InterceptorFlow};
-use zenoh_core::zlock;
-use zenoh_keyexpr::keyexpr_tree::impls::KeyedSetProvider;
-use zenoh_keyexpr::keyexpr_tree::{support::UnknownWildness, KeBoxTree};
-use zenoh_keyexpr::keyexpr_tree::{IKeyExprTree, IKeyExprTreeMut};
-use zenoh_protocol::network::NetworkBody;
-use zenoh_result::ZResult;
 
 pub(crate) fn downsampling_interceptor_factories(
     config: &Vec<DownsamplingItemConf>,
 ) -> ZResult<Vec<InterceptorFactory>> {
     let mut res: Vec<InterceptorFactory> = vec![];
 
+    let mut id_set = HashSet::new();
     for ds in config {
+        // check unicity of rule id
+        if let Some(id) = &ds.id {
+            if !id_set.insert(id.clone()) {
+                bail!("Invalid Downsampling config: id '{id}' is repeated");
+            }
+        }
+
         res.push(Box::new(DownsamplingInterceptorFactory::new(ds.clone())));
     }
 
@@ -42,9 +60,11 @@ pub(crate) fn downsampling_interceptor_factories(
 }
 
 pub struct DownsamplingInterceptorFactory {
-    interfaces: Option<Vec<String>>,
-    rules: Vec<DownsamplingRuleConf>,
-    flow: InterceptorFlow,
+    interfaces: Option<NEVec<String>>,
+    link_protocols: Option<NEVec<InterceptorLink>>,
+    rules: NEVec<DownsamplingRuleConf>,
+    flows: InterfaceEnabled,
+    messages: Arc<DownsamplingFilters>,
 }
 
 impl DownsamplingInterceptorFactory {
@@ -52,7 +72,12 @@ impl DownsamplingInterceptorFactory {
         Self {
             interfaces: conf.interfaces,
             rules: conf.rules,
-            flow: conf.flow,
+            link_protocols: conf.link_protocols,
+            flows: conf.flows.map(|f| (&f).into()).unwrap_or(InterfaceEnabled {
+                ingress: true,
+                egress: true,
+            }),
+            messages: Arc::new((&conf.messages).into()),
         }
     }
 }
@@ -62,39 +87,62 @@ impl InterceptorFactoryTrait for DownsamplingInterceptorFactory {
         &self,
         transport: &TransportUnicast,
     ) -> (Option<IngressInterceptor>, Option<EgressInterceptor>) {
-        tracing::debug!("New downsampler transport unicast {:?}", transport);
         if let Some(interfaces) = &self.interfaces {
-            tracing::debug!(
-                "New downsampler transport unicast config interfaces: {:?}",
-                interfaces
-            );
             if let Ok(links) = transport.get_links() {
                 for link in links {
-                    tracing::debug!(
-                        "New downsampler transport unicast link interfaces: {:?}",
-                        link.interfaces
-                    );
                     if !link.interfaces.iter().any(|x| interfaces.contains(x)) {
                         return (None, None);
                     }
                 }
             }
         };
+        if let Some(config_protocols) = &self.link_protocols {
+            match transport.get_auth_ids() {
+                Ok(auth_ids) => {
+                    if !auth_ids
+                        .link_auth_ids()
+                        .iter()
+                        .map(|auth_id| InterceptorLinkWrapper::from(auth_id).0)
+                        .any(|v| config_protocols.contains(&v))
+                    {
+                        return (None, None);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error loading transport AuthIds: {e}");
+                    return (None, None);
+                }
+            }
+        };
 
-        match self.flow {
-            InterceptorFlow::Ingress => (
-                Some(Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
-                    self.rules.clone(),
-                )))),
-                None,
-            ),
-            InterceptorFlow::Egress => (
-                None,
-                Some(Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
-                    self.rules.clone(),
-                )))),
-            ),
-        }
+        tracing::debug!(
+            "New{}{} downsampler on transport unicast {:?}",
+            self.flows.ingress.then_some(" ingress").unwrap_or_default(),
+            self.flows.egress.then_some(" egress").unwrap_or_default(),
+            transport
+        );
+        (
+            self.flows.ingress.then(|| {
+                Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
+                    self.messages.clone(),
+                    &self.rules,
+                    #[cfg(feature = "stats")]
+                    InterceptorFlow::Ingress,
+                    #[cfg(feature = "stats")]
+                    transport.get_stats().unwrap_or_default(),
+                ))) as IngressInterceptor
+            }),
+            self.flows.egress.then(|| {
+                Box::new(ComputeOnMiss::new(DownsamplingInterceptor::new(
+                    self.messages.clone(),
+                    &self.rules,
+                    #[cfg(feature = "stats")]
+                    InterceptorFlow::Egress,
+                    #[cfg(feature = "stats")]
+                    transport.get_stats().unwrap_or_default(),
+                ))) as EgressInterceptor
+            }),
+        )
     }
 
     fn new_transport_multicast(
@@ -109,32 +157,76 @@ impl InterceptorFactoryTrait for DownsamplingInterceptorFactory {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DownsamplingFilters {
+    push: bool,
+    query: bool,
+    reply: bool,
+}
+
+impl From<&NEVec<DownsamplingMessage>> for DownsamplingFilters {
+    fn from(value: &NEVec<DownsamplingMessage>) -> Self {
+        let mut res = Self::default();
+        for v in value {
+            match v {
+                DownsamplingMessage::Push => res.push = true,
+                DownsamplingMessage::Query => res.query = true,
+                DownsamplingMessage::Reply => res.reply = true,
+            }
+        }
+        res
+    }
+}
+
 struct Timestate {
     pub threshold: tokio::time::Duration,
     pub latest_message_timestamp: tokio::time::Instant,
 }
 
 pub(crate) struct DownsamplingInterceptor {
+    filtered_messages: Arc<DownsamplingFilters>,
     ke_id: Arc<Mutex<KeBoxTree<usize, UnknownWildness, KeyedSetProvider>>>,
     ke_state: Arc<Mutex<HashMap<usize, Timestate>>>,
+    #[cfg(feature = "stats")]
+    flow: InterceptorFlow,
+    #[cfg(feature = "stats")]
+    stats: Arc<TransportStats>,
 }
 
-impl InterceptorTrait for DownsamplingInterceptor {
-    fn compute_keyexpr_cache(&self, key_expr: &KeyExpr<'_>) -> Option<Box<dyn Any + Send + Sync>> {
-        let ke_id = zlock!(self.ke_id);
-        if let Some(id) = ke_id.weight_at(&key_expr.clone()) {
-            Some(Box::new(Some(*id)))
-        } else {
-            Some(Box::new(None::<usize>))
+impl DownsamplingInterceptor {
+    fn is_msg_filtered(&self, ctx: &RoutingContext<NetworkMessageMut>) -> bool {
+        match ctx.msg.body {
+            NetworkBodyMut::Push(_) => self.filtered_messages.push,
+            NetworkBodyMut::Request(_) => self.filtered_messages.query,
+            NetworkBodyMut::Response(_) => self.filtered_messages.reply,
+            NetworkBodyMut::ResponseFinal(_) => false,
+            NetworkBodyMut::Interest(_) => false,
+            NetworkBodyMut::Declare(_) => false,
+            NetworkBodyMut::OAM(_) => false,
         }
+    }
+}
+
+// The flag is used to print a message only once
+static INFO_FLAG: AtomicBool = AtomicBool::new(false);
+
+impl InterceptorTrait for DownsamplingInterceptor {
+    fn compute_keyexpr_cache(&self, key_expr: &keyexpr) -> Option<Box<dyn Any + Send + Sync>> {
+        let ke_id = zlock!(self.ke_id);
+        if let Some(node) = ke_id.intersecting_keys(key_expr).next() {
+            if let Some(id) = ke_id.weight_at(&node) {
+                return Some(Box::new(Some(*id)));
+            }
+        }
+        Some(Box::new(None::<usize>))
     }
 
     fn intercept(
         &self,
-        ctx: RoutingContext<NetworkMessage>,
+        ctx: &mut RoutingContext<NetworkMessageMut>,
         cache: Option<&Box<dyn Any + Send + Sync>>,
-    ) -> Option<RoutingContext<NetworkMessage>> {
-        if matches!(ctx.msg.body, NetworkBody::Push(_)) {
+    ) -> bool {
+        if self.is_msg_filtered(ctx) {
             if let Some(cache) = cache {
                 if let Some(id) = cache.downcast_ref::<Option<usize>>() {
                     if let Some(id) = id {
@@ -144,9 +236,28 @@ impl InterceptorTrait for DownsamplingInterceptor {
 
                             if timestamp - state.latest_message_timestamp >= state.threshold {
                                 state.latest_message_timestamp = timestamp;
-                                return Some(ctx);
+                                return true;
                             } else {
-                                return None;
+                                if !INFO_FLAG.swap(true, Ordering::Relaxed) {
+                                    tracing::info!("Some message(s) have been dropped by the downsampling interceptor. Enable trace level tracing for more details.");
+                                }
+                                tracing::trace!(
+                                    "Message dropped by the downsampling interceptor: {}({}) from:{} to:{}",
+                                    ctx.msg,
+                                    ctx.full_expr().unwrap_or_default(),
+                                    ctx.inface().map(|f| f.to_string()).unwrap_or_default(),
+                                    ctx.outface().map(|f| f.to_string()).unwrap_or_default(),
+                                );
+                                #[cfg(feature = "stats")]
+                                match self.flow {
+                                    InterceptorFlow::Egress => {
+                                        self.stats.inc_tx_downsampler_dropped_msgs(1);
+                                    }
+                                    InterceptorFlow::Ingress => {
+                                        self.stats.inc_rx_downsampler_dropped_msgs(1);
+                                    }
+                                }
+                                return false;
                             }
                         } else {
                             tracing::debug!("unexpected cache ID {}", id);
@@ -157,15 +268,19 @@ impl InterceptorTrait for DownsamplingInterceptor {
                 }
             }
         }
-
-        Some(ctx)
+        true
     }
 }
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
 impl DownsamplingInterceptor {
-    pub fn new(rules: Vec<DownsamplingRuleConf>) -> Self {
+    pub fn new(
+        messages: Arc<DownsamplingFilters>,
+        rules: &NEVec<DownsamplingRuleConf>,
+        #[cfg(feature = "stats")] flow: InterceptorFlow,
+        #[cfg(feature = "stats")] stats: Arc<TransportStats>,
+    ) -> Self {
         let mut ke_id = KeBoxTree::default();
         let mut ke_state = HashMap::default();
         for (id, rule) in rules.into_iter().enumerate() {
@@ -184,10 +299,21 @@ impl DownsamplingInterceptor {
                     latest_message_timestamp,
                 },
             );
+            tracing::debug!(
+                "New downsampler rule enabled: key_expr={:?}, threshold={:?}, messages={:?}",
+                rule.key_expr,
+                threshold,
+                messages,
+            );
         }
         Self {
+            filtered_messages: messages,
             ke_id: Arc::new(Mutex::new(ke_id)),
             ke_state: Arc::new(Mutex::new(ke_state)),
+            #[cfg(feature = "stats")]
+            flow,
+            #[cfg(feature = "stats")]
+            stats,
         }
     }
 }

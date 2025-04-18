@@ -11,8 +11,6 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{common::extension, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Reliability};
-use alloc::vec::Vec;
 use zenoh_buffers::{
     reader::{BacktrackableReader, DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -20,12 +18,13 @@ use zenoh_buffers::{
 use zenoh_protocol::{
     common::{iext, imsg},
     core::Reliability,
-    network::NetworkMessage,
     transport::{
         frame::{ext, flag, Frame, FrameHeader},
         id, TransportSn,
     },
 };
+
+use crate::{common::extension, RCodec, WCodec, Zenoh080, Zenoh080Header};
 
 // FrameHeader
 impl<W> WCodec<&FrameHeader, &mut W> for Zenoh080
@@ -46,7 +45,7 @@ where
         if let Reliability::Reliable = reliability {
             header |= flag::R;
         }
-        if ext_qos != &ext::QoSType::default() {
+        if ext_qos != &ext::QoSType::DEFAULT {
             header |= flag::Z;
         }
         self.write(&mut *writer, header)?;
@@ -55,7 +54,7 @@ where
         self.write(&mut *writer, sn)?;
 
         // Extensions
-        if ext_qos != &ext::QoSType::default() {
+        if ext_qos != &ext::QoSType::DEFAULT {
             self.write(&mut *writer, (x.ext_qos, false))?;
         }
 
@@ -94,7 +93,7 @@ where
         let sn: TransportSn = self.codec.read(&mut *reader)?;
 
         // Extensions
-        let mut ext_qos = ext::QoSType::default();
+        let mut ext_qos = ext::QoSType::DEFAULT;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -144,9 +143,7 @@ where
         self.write(&mut *writer, &header)?;
 
         // Body
-        for m in payload.iter() {
-            self.write(&mut *writer, m)?;
-        }
+        writer.write_zslice(payload)?;
 
         Ok(())
     }
@@ -173,20 +170,7 @@ where
 
     fn read(self, reader: &mut R) -> Result<Frame, Self::Error> {
         let header: FrameHeader = self.read(&mut *reader)?;
-
-        let rcode = Zenoh080Reliability::new(header.reliability);
-        let mut payload = Vec::new();
-        while reader.can_read() {
-            let mark = reader.mark();
-            let res: Result<NetworkMessage, DidntRead> = rcode.read(&mut *reader);
-            match res {
-                Ok(m) => payload.push(m),
-                Err(_) => {
-                    reader.rewind(mark);
-                    break;
-                }
-            }
-        }
+        let payload = reader.read_zslice(reader.remaining())?;
 
         Ok(Frame {
             reliability: header.reliability,

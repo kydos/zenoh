@@ -11,6 +11,18 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::sync::MutexGuard;
+
+use zenoh_codec::network::NetworkMessageIter;
+use zenoh_core::{zlock, zread};
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{Priority, Reliability},
+    network::NetworkMessage,
+    transport::{Close, Fragment, Frame, KeepAlive, TransportBody, TransportMessage, TransportSn},
+};
+use zenoh_result::{bail, zerror, ZResult};
+
 use super::transport::TransportUnicastUniversal;
 use crate::{
     common::{
@@ -20,15 +32,6 @@ use crate::{
     unicast::transport_unicast_inner::TransportUnicastTrait,
     TransportPeerEventHandler,
 };
-use std::sync::MutexGuard;
-use zenoh_core::{zlock, zread};
-use zenoh_link::Link;
-use zenoh_protocol::{
-    core::{Priority, Reliability},
-    network::NetworkMessage,
-    transport::{Close, Fragment, Frame, KeepAlive, TransportBody, TransportMessage, TransportSn},
-};
-use zenoh_result::{bail, zerror, ZResult};
 
 /*************************************/
 /*            TRANSPORT RX           */
@@ -42,11 +45,14 @@ impl TransportUnicastUniversal {
     ) -> ZResult<()> {
         #[cfg(feature = "shared-memory")]
         {
-            if self.config.is_shm {
-                crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.state.unicast.shm.reader)?;
+            if self.config.shm.is_some() {
+                if let Err(e) = crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.shmr) {
+                    tracing::debug!("Error receiving SHM buffer: {e}");
+                    return Ok(());
+                }
             }
         }
-        callback.handle_message(msg)
+        callback.handle_message(msg.as_mut())
     }
 
     fn handle_close(&self, link: &Link, _reason: u8, session: bool) -> ZResult<()> {
@@ -77,7 +83,7 @@ impl TransportUnicastUniversal {
         let priority = ext_qos.priority();
         let c = if self.is_qos() {
             &self.priority_rx[priority as usize]
-        } else if priority == Priority::default() {
+        } else if priority == Priority::DEFAULT {
             &self.priority_rx[0]
         } else {
             bail!(
@@ -92,11 +98,13 @@ impl TransportUnicastUniversal {
             Reliability::BestEffort => zlock!(c.best_effort),
         };
 
-        self.verify_sn(sn, &mut guard)?;
-
+        if !self.verify_sn("Frame", sn, &mut guard)? {
+            // Drop invalid message and continue
+            return Ok(());
+        }
         let callback = zread!(self.callback).clone();
         if let Some(callback) = callback.as_ref() {
-            for msg in payload.drain(..) {
+            for msg in NetworkMessageIter::new(reliability, &mut payload) {
                 self.trigger_callback(callback.as_ref(), msg)?;
             }
         } else {
@@ -106,6 +114,7 @@ impl TransportUnicastUniversal {
                 payload
             );
         }
+
         Ok(())
     }
 
@@ -115,12 +124,14 @@ impl TransportUnicastUniversal {
             more,
             sn,
             ext_qos: qos,
+            ext_first,
+            ext_drop,
             payload,
         } = fragment;
 
         let c = if self.is_qos() {
             &self.priority_rx[qos.priority() as usize]
-        } else if qos.priority() == Priority::default() {
+        } else if qos.priority() == Priority::DEFAULT {
             &self.priority_rx[0]
         } else {
             bail!(
@@ -135,28 +146,48 @@ impl TransportUnicastUniversal {
             Reliability::BestEffort => zlock!(c.best_effort),
         };
 
-        self.verify_sn(sn, &mut guard)?;
-
+        if !self.verify_sn("Fragment", sn, &mut guard)? {
+            // Drop invalid message and continue
+            return Ok(());
+        }
+        if self.config.patch.has_fragmentation_markers() {
+            if ext_first.is_some() {
+                guard.defrag.clear();
+            } else if guard.defrag.is_empty() {
+                tracing::trace!(
+                    "Transport: {}. First fragment received without start marker.",
+                    self.manager.config.zid,
+                );
+                return Ok(());
+            }
+            if ext_drop.is_some() {
+                guard.defrag.clear();
+                return Ok(());
+            }
+        }
         if guard.defrag.is_empty() {
             let _ = guard.defrag.sync(sn);
         }
-        guard.defrag.push(sn, payload)?;
+        if let Err(e) = guard.defrag.push(sn, payload) {
+            // Defrag errors don't close transport
+            tracing::trace!("{}", e);
+            return Ok(());
+        }
         if !more {
             // When shared-memory feature is disabled, msg does not need to be mutable
-            let msg = guard
-                .defrag
-                .defragment()
-                .ok_or_else(|| zerror!("Transport: {}. Defragmentation error.", self.config.zid))?;
-
-            let callback = zread!(self.callback).clone();
-            if let Some(callback) = callback.as_ref() {
-                return self.trigger_callback(callback.as_ref(), msg);
+            if let Some(msg) = guard.defrag.defragment() {
+                let callback = zread!(self.callback).clone();
+                if let Some(callback) = callback.as_ref() {
+                    return self.trigger_callback(callback.as_ref(), msg);
+                } else {
+                    tracing::debug!(
+                        "Transport: {}. No callback available, dropping messages: {:?}",
+                        self.config.zid,
+                        msg
+                    );
+                }
             } else {
-                tracing::debug!(
-                    "Transport: {}. No callback available, dropping messages: {:?}",
-                    self.config.zid,
-                    msg
-                );
+                tracing::trace!("Transport: {}. Defragmentation error.", self.config.zid);
             }
         }
 
@@ -165,26 +196,23 @@ impl TransportUnicastUniversal {
 
     fn verify_sn(
         &self,
+        message_type: &str,
         sn: TransportSn,
         guard: &mut MutexGuard<'_, TransportChannelRx>,
-    ) -> ZResult<()> {
+    ) -> ZResult<bool> {
         let precedes = guard.sn.roll(sn)?;
         if !precedes {
-            tracing::debug!(
-                "Transport: {}. Frame with invalid SN dropped: {}. Expected: {}.",
+            tracing::trace!(
+                "Transport: {}. {} with invalid SN dropped: {}. Expected: {}.",
                 self.config.zid,
+                message_type,
                 sn,
-                guard.sn.get()
+                guard.sn.next()
             );
-            // Drop the fragments if needed
-            if !guard.defrag.is_empty() {
-                guard.defrag.clear();
-            }
-            // Keep reading
-            return Ok(());
+            return Ok(false);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn read_messages(&self, mut batch: RBatch, link: &Link) -> ZResult<()> {

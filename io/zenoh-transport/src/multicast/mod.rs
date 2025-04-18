@@ -14,32 +14,32 @@ pub(crate) mod establishment;
 pub(crate) mod link;
 pub(crate) mod manager;
 pub(crate) mod rx;
-#[cfg(feature = "shared-memory")]
-pub(crate) mod shm;
 pub(crate) mod transport;
 pub(crate) mod tx;
 
-use super::common;
-use crate::{
-    multicast::link::TransportLinkMulticast, TransportMulticastEventHandler, TransportPeer,
-};
-pub use manager::{
-    TransportManagerBuilderMulticast, TransportManagerConfigMulticast,
-    TransportManagerParamsMulticast,
-};
 use std::{
     fmt::{self, Write},
     sync::{Arc, Weak},
+};
+
+pub use manager::{
+    TransportManagerBuilderMulticast, TransportManagerConfigMulticast,
+    TransportManagerParamsMulticast,
 };
 use transport::TransportMulticastInner;
 use zenoh_core::{zcondfeat, zread};
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::Bits,
-    network::NetworkMessage,
+    network::NetworkMessageMut,
     transport::{close, PrioritySn},
 };
 use zenoh_result::{zerror, ZResult};
+
+use super::common;
+use crate::{
+    multicast::link::TransportLinkMulticast, TransportMulticastEventHandler, TransportPeer,
+};
 
 /*************************************/
 /*       TRANSPORT MULTICAST         */
@@ -92,7 +92,7 @@ impl TransportMulticast {
     #[inline(always)]
     pub fn get_link(&self) -> ZResult<Link> {
         let transport = self.get_transport()?;
-        Ok(transport.get_link().into())
+        Ok(Link::new_multicast(&transport.get_link().link))
     }
 
     #[inline(always)]
@@ -111,15 +111,10 @@ impl TransportMulticast {
     }
 
     #[inline(always)]
-    pub fn schedule(&self, message: NetworkMessage) -> ZResult<()> {
+    pub fn schedule(&self, message: NetworkMessageMut) -> ZResult<()> {
         let transport = self.get_transport()?;
-        transport.schedule(message);
+        transport.schedule(message)?;
         Ok(())
-    }
-
-    #[inline(always)]
-    pub fn handle_message(&self, message: NetworkMessage) -> ZResult<()> {
-        self.schedule(message)
     }
 
     #[cfg(feature = "stats")]

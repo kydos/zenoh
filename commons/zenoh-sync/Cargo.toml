@@ -29,13 +29,13 @@ description = "Internal crate for zenoh."
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+arc-swap = { workspace = true }
 event-listener = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 zenoh-buffers = { workspace = true }
 zenoh-collections = { workspace = true, features = ["default"] }
 zenoh-core = { workspace = true }
-zenoh-runtime = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "sync", "rt-multi-thread", "time"] }

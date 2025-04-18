@@ -26,7 +26,7 @@ description = "Internal crate for zenoh."
 
 [features]
 transport_quic = ["zenoh-link-quic"]
-transport_tcp = ["zenoh-link-tcp"]
+transport_tcp = ["zenoh-link-tcp", "zenoh-config/transport_tcp"]
 transport_tls = ["zenoh-link-tls"]
 transport_udp = ["zenoh-link-udp"]
 transport_unixsock-stream = ["zenoh-link-unixsock_stream"]
@@ -36,8 +36,6 @@ transport_unixpipe = ["zenoh-link-unixpipe", "zenoh-link-unixpipe/transport_unix
 transport_vsock = ["zenoh-link-vsock"]
 
 [dependencies]
-async-trait = { workspace = true }
-rcgen = { workspace = true, optional = true }
 zenoh-config = { workspace = true }
 zenoh-link-commons = { workspace = true }
 zenoh-link-quic = { workspace = true, optional = true }

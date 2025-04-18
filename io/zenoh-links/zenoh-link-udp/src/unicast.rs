@@ -11,27 +11,34 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::{
+    collections::HashMap,
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use tokio::{net::UdpSocket, sync::Mutex as AsyncMutex};
+use tokio_util::sync::CancellationToken;
+use zenoh_core::{zasynclock, zlock};
+use zenoh_link_commons::{
+    get_ip_interface_names, ConstructibleLinkManagerUnicast, LinkAuthId, LinkManagerUnicastTrait,
+    LinkUnicast, LinkUnicastTrait, ListenersUnicastIP, NewLinkChannelSender, BIND_INTERFACE,
+    BIND_SOCKET,
+};
+use zenoh_protocol::{
+    core::{Address, EndPoint, Locator},
+    transport::BatchSize,
+};
+use zenoh_result::{bail, zerror, Error as ZError, ZResult};
+use zenoh_sync::Mvar;
+
 use super::{
     get_udp_addrs, socket_addr_to_udp_locator, UDP_ACCEPT_THROTTLE_TIME, UDP_DEFAULT_MTU,
     UDP_MAX_MTU,
 };
-use async_trait::async_trait;
-use std::collections::HashMap;
-use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio_util::sync::CancellationToken;
-use zenoh_core::{zasynclock, zlock};
-use zenoh_link_commons::{
-    get_ip_interface_names, ConstructibleLinkManagerUnicast, LinkManagerUnicastTrait, LinkUnicast,
-    LinkUnicastTrait, ListenersUnicastIP, NewLinkChannelSender, BIND_INTERFACE,
-};
-use zenoh_protocol::core::{EndPoint, Locator};
-use zenoh_result::{bail, zerror, Error as ZError, ZResult};
-use zenoh_sync::Mvar;
 
 type LinkHashMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), Weak<LinkUnicastUdpUnconnected>>>>;
 type LinkInput = (Vec<u8>, usize);
@@ -200,7 +207,7 @@ impl LinkUnicastTrait for LinkUnicastUdp {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
+    fn get_mtu(&self) -> BatchSize {
         *UDP_DEFAULT_MTU
     }
 
@@ -211,12 +218,17 @@ impl LinkUnicastTrait for LinkUnicastUdp {
 
     #[inline(always)]
     fn is_reliable(&self) -> bool {
-        false
+        super::IS_RELIABLE
     }
 
     #[inline(always)]
     fn is_streamed(&self) -> bool {
         false
+    }
+
+    #[inline(always)]
+    fn get_auth_id(&self) -> &LinkAuthId {
+        &LinkAuthId::Udp
     }
 }
 
@@ -260,19 +272,27 @@ impl LinkManagerUnicastUdp {
         &self,
         dst_addr: &SocketAddr,
         iface: Option<&str>,
+        bind_socket: Option<&str>,
     ) -> ZResult<(UdpSocket, SocketAddr, SocketAddr)> {
+        let src_socket_addr = if let Some(bind_socket) = bind_socket {
+            let address = Address::from(bind_socket);
+            get_udp_addrs(address)
+                .await?
+                .next()
+                .ok_or_else(|| zerror!("No UDP socket addr found bound to {}", address))?
+        } else if dst_addr.is_ipv4() {
+            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+        } else {
+            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+        };
+
         // Establish a UDP socket
-        let socket = UdpSocket::bind(SocketAddr::new(
-            if dst_addr.is_ipv4() {
-                Ipv4Addr::UNSPECIFIED.into()
-            } else {
-                Ipv6Addr::UNSPECIFIED.into()
-            }, // UDP addr
-            0, // UDP port
-        ))
-        .await
-        .map_err(|e| {
-            let e = zerror!("Can not create a new UDP link bound to {}: {}", dst_addr, e);
+        let socket = UdpSocket::bind(src_socket_addr).await.map_err(|e| {
+            let e = zerror!(
+                "Can not create a new UDP link bound to {}: {}",
+                src_socket_addr,
+                e
+            );
             tracing::warn!("{}", e);
             e
         })?;
@@ -283,20 +303,30 @@ impl LinkManagerUnicastUdp {
 
         // Connect the socket to the remote address
         socket.connect(dst_addr).await.map_err(|e| {
-            let e = zerror!("Can not create a new UDP link bound to {}: {}", dst_addr, e);
+            let e = zerror!("Can not connect a new UDP link to {}: {}", dst_addr, e);
             tracing::warn!("{}", e);
             e
         })?;
 
         // Get source and destination UDP addresses
         let src_addr = socket.local_addr().map_err(|e| {
-            let e = zerror!("Can not create a new UDP link bound to {}: {}", dst_addr, e);
+            let e = zerror!(
+                "Can not get local_addr for UDP link bound src {}: to :{} : {}",
+                src_socket_addr,
+                dst_addr,
+                e
+            );
             tracing::warn!("{}", e);
             e
         })?;
 
         let dst_addr = socket.peer_addr().map_err(|e| {
-            let e = zerror!("Can not create a new UDP link bound to {}: {}", dst_addr, e);
+            let e = zerror!(
+                "Can not get peer_addr for UDP link bound src {}: to :{} : {}",
+                src_socket_addr,
+                dst_addr,
+                e
+            );
             tracing::warn!("{}", e);
             e
         })?;
@@ -339,9 +369,19 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUdp {
         let config = endpoint.config();
         let iface = config.get(BIND_INTERFACE);
 
+        if let (Some(_), Some(_)) = (config.get(BIND_INTERFACE), config.get(BIND_SOCKET)) {
+            bail!(
+                "Using Config options `iface` and `bind` in conjunction is unsupported at this time {} {:?}",
+                BIND_INTERFACE,
+                BIND_SOCKET
+            )
+        }
+
+        let bind_socket = config.get(BIND_SOCKET);
+
         let mut errs: Vec<ZError> = vec![];
         for da in dst_addrs {
-            match self.new_link_inner(&da, iface).await {
+            match self.new_link_inner(&da, iface, bind_socket).await {
                 Ok((socket, src_addr, dst_addr)) => {
                     // Create UDP link
                     let link = Arc::new(LinkUnicastUdp::new(
@@ -391,10 +431,13 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUdp {
                     )?;
 
                     let token = self.listeners.token.child_token();
-                    let c_token = token.clone();
-                    let c_manager = self.manager.clone();
 
-                    let task = async move { accept_read_task(socket, c_token, c_manager).await };
+                    let task = {
+                        let token = token.clone();
+                        let manager = self.manager.clone();
+
+                        async move { accept_read_task(socket, token, manager).await }
+                    };
 
                     let locator = endpoint.to_locator();
                     self.listeners

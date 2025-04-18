@@ -11,218 +11,239 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::str::FromStr;
+#![cfg(feature = "unstable")]
+#![cfg(feature = "internal_config")]
+
 use std::time::Duration;
-use zenoh::prelude::r#async::*;
+
+use zenoh::{
+    handlers::FifoChannelHandler,
+    matching::{MatchingListener, MatchingStatus},
+    sample::Locality,
+    Result as ZResult, Session,
+};
+use zenoh_config::{ModeDependentValue, WhatAmI};
 use zenoh_core::ztimeout;
-use zenoh_result::ZResult as Result;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[cfg(feature = "unstable")]
 async fn create_session_pair(locator: &str) -> (Session, Session) {
     let config1 = {
-        let mut config = zenoh::config::peer();
+        let mut config = zenoh::Config::default();
         config.scouting.multicast.set_enabled(Some(false)).unwrap();
         config
             .listen
-            .set_endpoints(vec![locator.parse().unwrap()])
+            .endpoints
+            .set(vec![locator.parse().unwrap()])
             .unwrap();
         config
     };
-    let config2 = zenoh::config::client([Locator::from_str(locator).unwrap()]);
+    let mut config2 = zenoh::Config::default();
+    config2.set_mode(Some(WhatAmI::Client)).unwrap();
+    config2
+        .connect
+        .set_endpoints(ModeDependentValue::Unique(vec![locator.parse().unwrap()]))
+        .unwrap();
 
-    let session1 = ztimeout!(zenoh::open(config1).res_async()).unwrap();
-    let session2 = ztimeout!(zenoh::open(config2).res_async()).unwrap();
+    let session1 = ztimeout!(zenoh::open(config1)).unwrap();
+    let session2 = ztimeout!(zenoh::open(config2)).unwrap();
     (session1, session2)
 }
 
-#[cfg(feature = "unstable")]
+fn get_matching_listener_status(
+    matching_listener: &MatchingListener<FifoChannelHandler<MatchingStatus>>,
+) -> Option<bool> {
+    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
+    received_status.ok().flatten().map(|s| s.matching())
+}
+
+fn is_locality_compatible(locality: Locality, same_session: bool) -> bool {
+    match locality {
+        Locality::SessionLocal => same_session,
+        Locality::Remote => !same_session,
+        Locality::Any => true,
+    }
+}
+
+async fn zenoh_querier_matching_status_inner(querier_locality: Locality, same_session: bool) {
+    println!(
+        "Querier origin :{:?}, same session: {same_session}",
+        querier_locality
+    );
+    zenoh_util::init_log_from_env_or("error");
+    let key_expr = match querier_locality {
+        Locality::SessionLocal => "zenoh_querier_matching_status_local_test",
+        Locality::Remote => "zenoh_querier_matching_status_remote_test",
+        Locality::Any => "zenoh_querier_matching_status_any_test",
+    };
+
+    let (session1, session2) = match same_session {
+        false => create_session_pair("tcp/127.0.0.1:18002").await,
+        true => {
+            let s1 = ztimeout!(zenoh::open(zenoh::Config::default())).unwrap();
+            let s2 = s1.clone();
+            (s1, s2)
+        }
+    };
+    let locality_compatible = is_locality_compatible(querier_locality, same_session);
+
+    let querier1 = ztimeout!(session1
+        .declare_querier(format!("{key_expr}/value"))
+        .target(zenoh::query::QueryTarget::BestMatching)
+        .allowed_destination(querier_locality))
+    .unwrap();
+
+    let querier2 = ztimeout!(session1
+        .declare_querier(format!("{key_expr}/*"))
+        .target(zenoh::query::QueryTarget::AllComplete)
+        .allowed_destination(querier_locality))
+    .unwrap();
+
+    let matching_listener1 = ztimeout!(querier1.matching_listener()).unwrap();
+    let matching_listener2 = ztimeout!(querier2.matching_listener()).unwrap();
+
+    assert!(!ztimeout!(querier1.matching_status()).unwrap().matching());
+    assert!(!ztimeout!(querier2.matching_status()).unwrap().matching());
+
+    assert_eq!(get_matching_listener_status(&matching_listener1), None);
+    assert_eq!(get_matching_listener_status(&matching_listener2), None);
+
+    let qbl1 = ztimeout!(session2
+        .declare_queryable(format!("{key_expr}/value"))
+        .complete(false))
+    .unwrap();
+    // There is a bug that hats do not distinguish whether they register/unregister complete or incomplete queryable,
+    // if there are more than one with the same keyexpr on the same face
+    //let qbl2 = ztimeout!(session2
+    //    .declare_queryable(format!("{key_expr}/*"))
+    //    .complete(false))
+    //.unwrap();
+
+    let _qbl3 = ztimeout!(session2
+        .declare_queryable(format!("{key_expr}/value3"))
+        .complete(true))
+    .unwrap();
+
+    assert_eq!(
+        get_matching_listener_status(&matching_listener1),
+        locality_compatible.then_some(true)
+    );
+    assert_eq!(get_matching_listener_status(&matching_listener2), None);
+
+    assert_eq!(
+        ztimeout!(querier1.matching_status()).unwrap().matching(),
+        locality_compatible
+    );
+    assert!(!ztimeout!(querier2.matching_status()).unwrap().matching());
+
+    let qbl4 = ztimeout!(session2
+        .declare_queryable(format!("{key_expr}/*"))
+        .complete(true))
+    .unwrap();
+    assert_eq!(
+        get_matching_listener_status(&matching_listener2),
+        locality_compatible.then_some(true)
+    );
+    assert_eq!(
+        ztimeout!(querier2.matching_status()).unwrap().matching(),
+        locality_compatible
+    );
+
+    ztimeout!(qbl4.undeclare()).unwrap();
+
+    assert_eq!(get_matching_listener_status(&matching_listener1), None);
+    assert_eq!(
+        get_matching_listener_status(&matching_listener2),
+        locality_compatible.then_some(false)
+    );
+    assert_eq!(
+        ztimeout!(querier1.matching_status()).unwrap().matching(),
+        locality_compatible
+    );
+    assert!(!ztimeout!(querier2.matching_status()).unwrap().matching());
+
+    ztimeout!(qbl1.undeclare()).unwrap();
+    // ztimeout!(qbl2.undeclare()).unwrap();
+    assert_eq!(
+        get_matching_listener_status(&matching_listener1),
+        locality_compatible.then_some(false)
+    );
+    assert_eq!(get_matching_listener_status(&matching_listener2), None);
+    assert!(!ztimeout!(querier1.matching_status()).unwrap().matching());
+    assert!(!ztimeout!(querier2.matching_status()).unwrap().matching());
+}
+
+async fn zenoh_publisher_matching_status_inner(publisher_locality: Locality, same_session: bool) {
+    println!(
+        "Publisher origin: {:?}, same session: {same_session}",
+        publisher_locality
+    );
+    zenoh_util::init_log_from_env_or("error");
+    let key_expr = match publisher_locality {
+        Locality::SessionLocal => "zenoh_publisher_matching_status_local_test",
+        Locality::Remote => "zenoh_publisher_matching_status_remote_test",
+        Locality::Any => "zenoh_publisher_matching_status_any_test",
+    };
+
+    let (session1, session2) = match same_session {
+        false => create_session_pair("tcp/127.0.0.1:18001").await,
+        true => {
+            let s1 = ztimeout!(zenoh::open(zenoh::Config::default())).unwrap();
+            let s2 = s1.clone();
+            (s1, s2)
+        }
+    };
+    let locality_compatible = is_locality_compatible(publisher_locality, same_session);
+
+    let publisher = ztimeout!(session1
+        .declare_publisher(format!("{key_expr}/*"))
+        .allowed_destination(publisher_locality))
+    .unwrap();
+
+    let matching_listener = ztimeout!(publisher.matching_listener()).unwrap();
+
+    assert_eq!(get_matching_listener_status(&matching_listener), None);
+
+    let sub = ztimeout!(session2.declare_subscriber(format!("{key_expr}/value"))).unwrap();
+
+    assert_eq!(
+        get_matching_listener_status(&matching_listener),
+        locality_compatible.then_some(true)
+    );
+    assert_eq!(
+        ztimeout!(publisher.matching_status()).unwrap().matching(),
+        locality_compatible
+    );
+
+    ztimeout!(sub.undeclare()).unwrap();
+
+    assert_eq!(
+        get_matching_listener_status(&matching_listener),
+        locality_compatible.then_some(false)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn zenoh_matching_status_any() -> Result<()> {
-    use flume::RecvTimeoutError;
-
-    let (session1, session2) = create_session_pair("tcp/127.0.0.1:18001").await;
-
-    let publisher1 = ztimeout!(session1
-        .declare_publisher("zenoh_matching_status_any_test")
-        .allowed_destination(Locality::Any)
-        .res_async())
-    .unwrap();
-
-    let matching_listener = ztimeout!(publisher1.matching_listener().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    let sub = ztimeout!(session1
-        .declare_subscriber("zenoh_matching_status_any_test")
-        .res_async())
-    .unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(true));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(matching_status.matching_subscribers());
-
-    ztimeout!(sub.undeclare().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(false));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    let sub = ztimeout!(session2
-        .declare_subscriber("zenoh_matching_status_any_test")
-        .res_async())
-    .unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(true));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(matching_status.matching_subscribers());
-
-    ztimeout!(sub.undeclare().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(false));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
+async fn zenoh_querier_matching_status() -> ZResult<()> {
+    zenoh_util::init_log_from_env_or("error");
+    zenoh_querier_matching_status_inner(Locality::Any, true).await;
+    zenoh_querier_matching_status_inner(Locality::Any, false).await;
+    zenoh_querier_matching_status_inner(Locality::Remote, true).await;
+    zenoh_querier_matching_status_inner(Locality::Remote, false).await;
+    zenoh_querier_matching_status_inner(Locality::SessionLocal, true).await;
+    zenoh_querier_matching_status_inner(Locality::SessionLocal, false).await;
     Ok(())
 }
 
-#[cfg(feature = "unstable")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn zenoh_matching_status_remote() -> Result<()> {
-    use flume::RecvTimeoutError;
-
-    let session1 = ztimeout!(zenoh::open(config::peer()).res_async()).unwrap();
-
-    let session2 = ztimeout!(zenoh::open(config::peer()).res_async()).unwrap();
-
-    let publisher1 = ztimeout!(session1
-        .declare_publisher("zenoh_matching_status_remote_test")
-        .allowed_destination(Locality::Remote)
-        .res_async())
-    .unwrap();
-
-    let matching_listener = ztimeout!(publisher1.matching_listener().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    let sub = ztimeout!(session1
-        .declare_subscriber("zenoh_matching_status_remote_test")
-        .res_async())
-    .unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    ztimeout!(sub.undeclare().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    let sub = ztimeout!(session2
-        .declare_subscriber("zenoh_matching_status_remote_test")
-        .res_async())
-    .unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(true));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(matching_status.matching_subscribers());
-
-    ztimeout!(sub.undeclare().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(false));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    Ok(())
-}
-
-#[cfg(feature = "unstable")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn zenoh_matching_status_local() -> Result<()> {
-    use flume::RecvTimeoutError;
-
-    let session1 = ztimeout!(zenoh::open(config::peer()).res_async()).unwrap();
-
-    let session2 = ztimeout!(zenoh::open(config::peer()).res_async()).unwrap();
-
-    let publisher1 = ztimeout!(session1
-        .declare_publisher("zenoh_matching_status_local_test")
-        .allowed_destination(Locality::SessionLocal)
-        .res_async())
-    .unwrap();
-
-    let matching_listener = ztimeout!(publisher1.matching_listener().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    let sub = ztimeout!(session1
-        .declare_subscriber("zenoh_matching_status_local_test")
-        .res_async())
-    .unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(true));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(matching_status.matching_subscribers());
-
-    ztimeout!(sub.undeclare().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.ok().map(|s| s.matching_subscribers()) == Some(false));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    let sub = ztimeout!(session2
-        .declare_subscriber("zenoh_matching_status_local_test")
-        .res_async())
-    .unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
-    ztimeout!(sub.undeclare().res_async()).unwrap();
-
-    let received_status = matching_listener.recv_timeout(RECV_TIMEOUT);
-    assert!(received_status.err() == Some(RecvTimeoutError::Timeout));
-
-    let matching_status = ztimeout!(publisher1.matching_status().res_async()).unwrap();
-    assert!(!matching_status.matching_subscribers());
-
+async fn zenoh_publisher_matching_status() -> ZResult<()> {
+    zenoh_util::init_log_from_env_or("error");
+    zenoh_publisher_matching_status_inner(Locality::Any, true).await;
+    zenoh_publisher_matching_status_inner(Locality::Any, false).await;
+    zenoh_publisher_matching_status_inner(Locality::Remote, true).await;
+    zenoh_publisher_matching_status_inner(Locality::Remote, false).await;
+    zenoh_publisher_matching_status_inner(Locality::SessionLocal, true).await;
+    zenoh_publisher_matching_status_inner(Locality::SessionLocal, false).await;
     Ok(())
 }

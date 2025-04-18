@@ -36,7 +36,7 @@
 //! KeTrees come in two flavours:
 //! - [`KeBoxTree`] is the easier flavour. Much like a HashMap, it uniquely owns all of its nodes and data.
 //! - [`KeArcTree`] allows the shared ownership of nodes, allowing you to store subsections of the tree elsewhere
-//! without worrying about lifetimes.
+//!   without worrying about lifetimes.
 //!
 //! # Usage
 //! KeTrees were designed to maximize code reuse. As such, their core properties are reflected through the [`IKeyExprTree`] and [`IKeyExprTreeMut`] traits.
@@ -47,7 +47,7 @@
 //! # Iterators
 //! KeTrees provide iterators for the following operations:
 //! - Iterating on all nodes ([`IKeyExprTree::tree_iter`]/[`IKeyExprTreeMut::tree_iter_mut`])
-//! - Iterating on key-value pairs in the KeTree ([`IKeyExprTreeExt::key_value_pairs`])
+//! - Iterating on key-value pairs in the KeTree ([`IKeyExprTree::key_value_pairs`])
 //! - Iterating on nodes whose KE intersects with a queried KE ([`IKeyExprTree::intersecting_nodes`], [`IKeyExprTreeMut::intersecting_nodes_mut`])
 //! - Iterating on nodes whose KE are included by a queried KE ([`IKeyExprTree::included_nodes`], [`IKeyExprTreeMut::included_nodes_mut`])
 //! - Iterating on nodes whose KE includes a queried KE ([`IKeyExprTree::nodes_including`], [`IKeyExprTreeMut::nodes_including_mut`])

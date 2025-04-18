@@ -11,29 +11,24 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::TransportMulticastInner;
 use zenoh_core::zread;
-use zenoh_protocol::network::NetworkMessage;
+use zenoh_protocol::network::{NetworkMessageExt, NetworkMessageMut, NetworkMessageRef};
+use zenoh_result::ZResult;
+
+use super::transport::TransportMulticastInner;
+#[cfg(feature = "shared-memory")]
+use crate::shm::map_zmsg_to_partner;
 
 //noinspection ALL
 impl TransportMulticastInner {
-    fn schedule_on_link(&self, msg: NetworkMessage) -> bool {
-        macro_rules! zpush {
-            ($guard:expr, $pipeline:expr, $msg:expr) => {
-                // Drop the guard before the push_zenoh_message since
-                // the link could be congested and this operation could
-                // block for fairly long time
-                let pl = $pipeline.clone();
-                drop($guard);
-                return pl.push_network_message($msg);
-            };
-        }
-
+    fn schedule_on_link(&self, msg: NetworkMessageRef) -> ZResult<bool> {
         let guard = zread!(self.link);
         match guard.as_ref() {
             Some(l) => {
                 if let Some(pl) = l.pipeline.as_ref() {
-                    zpush!(guard, pl, msg);
+                    let pl = pl.clone();
+                    drop(guard);
+                    return Ok(pl.push_network_message(msg)?);
                 }
             }
             None => {
@@ -44,27 +39,22 @@ impl TransportMulticastInner {
             }
         }
 
-        false
+        Ok(false)
     }
 
     #[allow(unused_mut)] // When feature "shared-memory" is not enabled
     #[allow(clippy::let_and_return)] // When feature "stats" is not enabled
     #[inline(always)]
-    pub(super) fn schedule(&self, mut msg: NetworkMessage) -> bool {
+    pub(super) fn schedule(&self, mut msg: NetworkMessageMut) -> ZResult<bool> {
         #[cfg(feature = "shared-memory")]
         {
-            let res = if self.manager.config.multicast.is_shm {
-                crate::shm::map_zmsg_to_shminfo(&mut msg)
-            } else {
-                crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.state.multicast.shm.reader)
-            };
-            if let Err(e) = res {
+            if let Err(e) = map_zmsg_to_partner(&mut msg, &self.shm) {
                 tracing::trace!("Failed SHM conversion: {}", e);
-                return false;
+                return Ok(false);
             }
         }
 
-        let res = self.schedule_on_link(msg);
+        let res = self.schedule_on_link(msg.as_ref())?;
 
         #[cfg(feature = "stats")]
         if res {
@@ -73,6 +63,6 @@ impl TransportMulticastInner {
             self.stats.inc_tx_n_dropped(1);
         }
 
-        res
+        Ok(res)
     }
 }

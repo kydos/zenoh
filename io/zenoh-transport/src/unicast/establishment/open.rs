@@ -11,8 +11,29 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::time::Duration;
+
+use async_trait::async_trait;
+use zenoh_buffers::ZSlice;
+#[cfg(feature = "transport_auth")]
+use zenoh_core::zasynclock;
+use zenoh_core::{zcondfeat, zerror};
+use zenoh_link::{EndPoint, LinkUnicast};
+use zenoh_protocol::{
+    core::{Field, Resolution, WhatAmI, ZenohIdProto},
+    transport::{
+        batch_size, close, BatchSize, Close, InitSyn, OpenSyn, TransportBody, TransportMessage,
+        TransportSn,
+    },
+};
+use zenoh_result::ZResult;
+
 #[cfg(feature = "shared-memory")]
-use crate::unicast::shared_memory_unicast::Challenge;
+use super::ext::shm::AuthSegment;
+#[cfg(feature = "shared-memory")]
+use crate::shm::TransportShmConfig;
+#[cfg(feature = "auth_usrpwd")]
+use crate::unicast::establishment::ext::auth::UsrPwdId;
 use crate::{
     common::batch::BatchConfig,
     unicast::{
@@ -25,21 +46,6 @@ use crate::{
     },
     TransportManager,
 };
-use async_trait::async_trait;
-use std::time::Duration;
-use zenoh_buffers::ZSlice;
-#[cfg(feature = "transport_auth")]
-use zenoh_core::zasynclock;
-use zenoh_core::{zcondfeat, zerror};
-use zenoh_link::LinkUnicast;
-use zenoh_protocol::{
-    core::{Field, Resolution, WhatAmI, ZenohId},
-    transport::{
-        batch_size, close, BatchSize, Close, InitSyn, OpenSyn, TransportBody, TransportMessage,
-        TransportSn,
-    },
-};
-use zenoh_result::ZResult;
 
 type OpenError = (zenoh_result::Error, Option<u8>);
 
@@ -52,6 +58,7 @@ struct StateTransport {
     #[cfg(feature = "shared-memory")]
     ext_shm: ext::shm::StateOpen,
     ext_lowlatency: ext::lowlatency::StateOpen,
+    ext_patch: ext::patch::StateOpen,
 }
 
 #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
@@ -71,31 +78,33 @@ struct State {
 // InitSyn
 struct SendInitSynIn {
     mine_version: u8,
-    mine_zid: ZenohId,
+    mine_zid: ZenohIdProto,
     mine_whatami: WhatAmI,
 }
 
 // InitAck
 struct RecvInitAckOut {
-    other_zid: ZenohId,
+    other_zid: ZenohIdProto,
     other_whatami: WhatAmI,
     other_cookie: ZSlice,
     #[cfg(feature = "shared-memory")]
-    ext_shm: Challenge,
+    ext_shm: Option<AuthSegment>,
 }
 
 // OpenSyn
 struct SendOpenSynIn {
-    mine_zid: ZenohId,
+    mine_zid: ZenohIdProto,
     mine_lease: Duration,
-    other_zid: ZenohId,
+    other_zid: ZenohIdProto,
     other_cookie: ZSlice,
     #[cfg(feature = "shared-memory")]
-    ext_shm: Challenge,
+    ext_shm: Option<AuthSegment>,
 }
 
 struct SendOpenSynOut {
     mine_initial_sn: TransportSn,
+    #[cfg(feature = "shared-memory")]
+    ext_shm: Option<AuthSegment>,
 }
 
 // OpenAck
@@ -110,12 +119,13 @@ struct OpenLink<'a> {
     #[cfg(feature = "transport_multilink")]
     ext_mlink: ext::multilink::MultiLinkFsm<'a>,
     #[cfg(feature = "shared-memory")]
-    ext_shm: ext::shm::ShmFsm<'a>,
+    ext_shm: Option<ext::shm::ShmFsm<'a>>,
     #[cfg(feature = "transport_auth")]
     ext_auth: ext::auth::AuthFsm<'a>,
     ext_lowlatency: ext::lowlatency::LowLatencyFsm<'a>,
     #[cfg(feature = "transport_compression")]
     ext_compression: ext::compression::CompressionFsm<'a>,
+    ext_patch: ext::patch::PatchFsm<'a>,
 }
 
 #[async_trait]
@@ -131,21 +141,21 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
         let (link, state, input) = input;
 
         // Extension QoS
-        let ext_qos = self
+        let (ext_qos, ext_qos_link) = self
             .ext_qos
             .send_init_syn(&state.transport.ext_qos)
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
         // Extension Shm
-        let ext_shm = zcondfeat!(
-            "shared-memory",
-            self.ext_shm
+        #[cfg(feature = "shared-memory")]
+        let ext_shm = match self.ext_shm.as_ref() {
+            Some(ext) => ext
                 .send_init_syn(&state.transport.ext_shm)
                 .await
                 .map_err(|e| (e, Some(close::reason::GENERIC)))?,
-            None
-        );
+            None => None,
+        };
 
         // Extension Auth
         let ext_auth = zcondfeat!(
@@ -184,6 +194,13 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             None
         );
 
+        // Extension Patch
+        let ext_patch = self
+            .ext_patch
+            .send_init_syn(&state.transport.ext_patch)
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         let msg: TransportMessage = InitSyn {
             version: input.mine_version,
             whatami: input.mine_whatami,
@@ -191,13 +208,18 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             batch_size: state.transport.batch_size,
             resolution: state.transport.resolution,
             ext_qos,
+            ext_qos_link,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_patch,
         }
         .into();
+
+        tracing::trace!("Establishment Open InitSyn: {}. Sent: {:?}", link, msg);
 
         let _ = link
             .send(&msg)
@@ -219,6 +241,8 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             .recv()
             .await
             .map_err(|e| (e, Some(close::reason::INVALID)))?;
+
+        tracing::trace!("Establishment Open InitAck: {}. Received: {:?}", link, msg);
 
         let init_ack = match msg.body {
             TransportBody::InitAck(init_ack) => init_ack,
@@ -289,17 +313,22 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
 
         // Extension QoS
         self.ext_qos
-            .recv_init_ack((&mut state.transport.ext_qos, init_ack.ext_qos))
+            .recv_init_ack((
+                &mut state.transport.ext_qos,
+                (init_ack.ext_qos, init_ack.ext_qos_link),
+            ))
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
         // Extension Shm
         #[cfg(feature = "shared-memory")]
-        let shm_challenge = self
-            .ext_shm
-            .recv_init_ack((&mut state.transport.ext_shm, init_ack.ext_shm))
-            .await
-            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+        let shm_segment = match self.ext_shm.as_ref() {
+            Some(ext) => ext
+                .recv_init_ack(init_ack.ext_shm)
+                .await
+                .map_err(|e| (e, Some(close::reason::GENERIC)))?,
+            None => None,
+        };
 
         // Extension Auth
         #[cfg(feature = "transport_auth")]
@@ -328,12 +357,18 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
+        // Extension Patch
+        self.ext_patch
+            .recv_init_ack((&mut state.transport.ext_patch, init_ack.ext_patch))
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         let output = RecvInitAckOut {
             other_zid: init_ack.zid,
             other_whatami: init_ack.whatami,
             other_cookie: init_ack.cookie,
             #[cfg(feature = "shared-memory")]
-            ext_shm: shm_challenge,
+            ext_shm: shm_segment,
         };
         Ok(output)
     }
@@ -354,14 +389,14 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
         // Extension Shm
-        let ext_shm = zcondfeat!(
-            "shared-memory",
-            self.ext_shm
-                .send_open_syn((&state.transport.ext_shm, input.ext_shm))
+        #[cfg(feature = "shared-memory")]
+        let ext_shm = match self.ext_shm.as_ref() {
+            Some(ext_shm) => ext_shm
+                .send_open_syn(&input.ext_shm)
                 .await
                 .map_err(|e| (e, Some(close::reason::GENERIC)))?,
-            None
-        );
+            None => None,
+        };
 
         // Extension Auth
         let ext_auth = zcondfeat!(
@@ -403,11 +438,12 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
         // Build and send an OpenSyn message
         let mine_initial_sn =
             compute_sn(input.mine_zid, input.other_zid, state.transport.resolution);
-        let message: TransportMessage = OpenSyn {
+        let msg: TransportMessage = OpenSyn {
             lease: input.mine_lease,
             initial_sn: mine_initial_sn,
             cookie: input.other_cookie,
             ext_qos,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
@@ -417,11 +453,17 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
         .into();
 
         let _ = link
-            .send(&message)
+            .send(&msg)
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
-        let output = SendOpenSynOut { mine_initial_sn };
+        tracing::trace!("Establishment Open OpenSyn: {}. Sent: {:?}", link, msg);
+
+        let output = SendOpenSynOut {
+            mine_initial_sn,
+            #[cfg(feature = "shared-memory")]
+            ext_shm: input.ext_shm,
+        };
         Ok(output)
     }
 
@@ -437,6 +479,8 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             .recv()
             .await
             .map_err(|e| (e, Some(close::reason::INVALID)))?;
+
+        tracing::trace!("Establishment Open OpenAck: {}. Received: {:?}", link, msg);
 
         let open_ack = match msg.body {
             TransportBody::OpenAck(open_ack) => open_ack,
@@ -471,10 +515,11 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
 
         // Extension Shm
         #[cfg(feature = "shared-memory")]
-        self.ext_shm
-            .recv_open_ack((&mut state.transport.ext_shm, open_ack.ext_shm))
-            .await
-            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+        if let Some(ext) = self.ext_shm.as_ref() {
+            ext.recv_open_ack((&mut state.transport.ext_shm, open_ack.ext_shm))
+                .await
+                .map_err(|e| (e, Some(close::reason::GENERIC)))?
+        };
 
         // Extension Auth
         #[cfg(feature = "transport_auth")]
@@ -512,18 +557,22 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
 }
 
 pub(crate) async fn open_link(
+    endpoint: EndPoint,
     link: LinkUnicast,
     manager: &TransportManager,
 ) -> ZResult<TransportUnicast> {
+    let direction = TransportLinkUnicastDirection::Outbound;
     let is_streamed = link.is_streamed();
     let config = TransportLinkUnicastConfig {
-        direction: TransportLinkUnicastDirection::Outbound,
+        direction,
         batch: BatchConfig {
             mtu: link.get_mtu(),
             is_streamed,
             #[cfg(feature = "transport_compression")]
             is_compression: false, // Perform the exchange Init/Open exchange with no compression
         },
+        priorities: None,
+        reliability: None,
     };
     let mut link = TransportLinkUnicast::new(link, config);
     let mut fsm = OpenLink {
@@ -531,47 +580,61 @@ pub(crate) async fn open_link(
         #[cfg(feature = "transport_multilink")]
         ext_mlink: manager.state.unicast.multilink.fsm(&manager.prng),
         #[cfg(feature = "shared-memory")]
-        ext_shm: ext::shm::ShmFsm::new(&manager.state.unicast.shm),
+        ext_shm: manager
+            .state
+            .unicast
+            .auth_shm
+            .as_ref()
+            .map(ext::shm::ShmFsm::new),
         #[cfg(feature = "transport_auth")]
         ext_auth: manager.state.unicast.authenticator.fsm(&manager.prng),
         ext_lowlatency: ext::lowlatency::LowLatencyFsm::new(),
         #[cfg(feature = "transport_compression")]
         ext_compression: ext::compression::CompressionFsm::new(),
+        ext_patch: ext::patch::PatchFsm::new(),
     };
 
-    let mut state = State {
-        transport: StateTransport {
-            batch_size: manager
-                .config
-                .batch_size
-                .min(batch_size::UNICAST)
-                .min(link.config.batch.mtu),
-            resolution: manager.config.resolution,
-            ext_qos: ext::qos::StateOpen::new(manager.config.unicast.is_qos),
-            #[cfg(feature = "transport_multilink")]
-            ext_mlink: manager
-                .state
-                .unicast
-                .multilink
-                .open(manager.config.unicast.max_links > 1),
-            #[cfg(feature = "shared-memory")]
-            ext_shm: ext::shm::StateOpen::new(manager.config.unicast.is_shm),
+    // Clippy raises a warning because `batch_size::UNICAST` is currently equal to `BatchSize::MAX`.
+    // However, the current code catches the cases where `batch_size::UNICAST` is different from `BatchSize::MAX`.
+    #[allow(clippy::unnecessary_min_or_max)]
+    let batch_size = manager
+        .config
+        .batch_size
+        .min(link.config.batch.mtu)
+        .min(batch_size::UNICAST);
 
-            ext_lowlatency: ext::lowlatency::StateOpen::new(manager.config.unicast.is_lowlatency),
-        },
-        #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
-        link: StateLink {
-            #[cfg(feature = "transport_auth")]
-            ext_auth: manager
-                .state
-                .unicast
-                .authenticator
-                .open(&mut *zasynclock!(manager.prng)),
-            #[cfg(feature = "transport_compression")]
-            ext_compression: ext::compression::StateOpen::new(
-                manager.config.unicast.is_compression,
-            ),
-        },
+    let mut state = {
+        #[cfg(feature = "transport_auth")]
+        let mut prng = zasynclock!(manager.prng);
+
+        State {
+            transport: StateTransport {
+                batch_size,
+                resolution: manager.config.resolution,
+                ext_qos: ext::qos::StateOpen::new(manager.config.unicast.is_qos, &endpoint)?,
+                #[cfg(feature = "transport_multilink")]
+                ext_mlink: manager
+                    .state
+                    .unicast
+                    .multilink
+                    .open(manager.config.unicast.max_links > 1),
+                #[cfg(feature = "shared-memory")]
+                ext_shm: ext::shm::StateOpen::new(),
+                ext_lowlatency: ext::lowlatency::StateOpen::new(
+                    manager.config.unicast.is_lowlatency,
+                ),
+                ext_patch: ext::patch::StateOpen::new(),
+            },
+            #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
+            link: StateLink {
+                #[cfg(feature = "transport_auth")]
+                ext_auth: manager.state.unicast.authenticator.open(&mut *prng),
+                #[cfg(feature = "transport_compression")]
+                ext_compression: ext::compression::StateOpen::new(
+                    manager.config.unicast.is_compression,
+                ),
+            },
+        }
     };
 
     // Init handshake
@@ -619,18 +682,26 @@ pub(crate) async fn open_link(
         #[cfg(feature = "transport_multilink")]
         multilink: state.transport.ext_mlink.multilink(),
         #[cfg(feature = "shared-memory")]
-        is_shm: state.transport.ext_shm.is_shm(),
+        shm: match state.transport.ext_shm.negotiated_to_use_shm() {
+            true => osyn_out.ext_shm.map(TransportShmConfig::new),
+            false => None,
+        },
         is_lowlatency: state.transport.ext_lowlatency.is_lowlatency(),
+        #[cfg(feature = "auth_usrpwd")]
+        auth_id: UsrPwdId(None),
+        patch: state.transport.ext_patch.get(),
     };
 
     let o_config = TransportLinkUnicastConfig {
-        direction: TransportLinkUnicastDirection::Outbound,
+        direction,
         batch: BatchConfig {
             mtu: state.transport.batch_size,
             is_streamed,
             #[cfg(feature = "transport_compression")]
             is_compression: state.link.ext_compression.is_compression(),
         },
+        priorities: state.transport.ext_qos.priorities(),
+        reliability: state.transport.ext_qos.reliability(),
     };
     let o_link = link.reconfigure(o_config);
     let s_link = format!("{:?}", o_link);

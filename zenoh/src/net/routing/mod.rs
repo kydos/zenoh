@@ -16,22 +16,23 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 pub mod dispatcher;
 pub mod hat;
 pub mod interceptor;
+pub mod namespace;
 pub mod router;
 
 use std::{cell::OnceCell, sync::Arc};
 
-use zenoh_protocol::core::key_expr::OwnedKeyExpr;
-use zenoh_protocol::{core::WireExpr, network::NetworkMessage};
+use zenoh_keyexpr::keyexpr;
+use zenoh_protocol::{
+    core::WireExpr,
+    network::{NetworkMessageExt, NetworkMessageMut},
+};
 
 use self::{dispatcher::face::Face, router::Resource};
-
 use super::runtime;
-
-pub(crate) static PREFIX_LIVELINESS: &str = "@/liveliness";
 
 pub(crate) struct RoutingContext<Msg> {
     pub(crate) msg: Msg,
@@ -95,33 +96,22 @@ impl<Msg> RoutingContext<Msg> {
     pub(crate) fn outface(&self) -> Option<&Face> {
         self.outface.get()
     }
+
+    pub(crate) fn with_mut<R>(mut self, f: impl FnOnce(RoutingContext<&mut Msg>) -> R) -> R {
+        f(RoutingContext {
+            msg: &mut self.msg,
+            inface: self.inface,
+            outface: self.outface,
+            prefix: self.prefix,
+            full_expr: self.full_expr,
+        })
+    }
 }
 
-impl RoutingContext<NetworkMessage> {
+impl RoutingContext<NetworkMessageMut<'_>> {
     #[inline]
     pub(crate) fn wire_expr(&self) -> Option<&WireExpr> {
-        use zenoh_protocol::network::DeclareBody;
-        use zenoh_protocol::network::NetworkBody;
-        match &self.msg.body {
-            NetworkBody::Push(m) => Some(&m.wire_expr),
-            NetworkBody::Request(m) => Some(&m.wire_expr),
-            NetworkBody::Response(m) => Some(&m.wire_expr),
-            NetworkBody::ResponseFinal(_) => None,
-            NetworkBody::Declare(m) => match &m.body {
-                DeclareBody::DeclareKeyExpr(m) => Some(&m.wire_expr),
-                DeclareBody::UndeclareKeyExpr(_) => None,
-                DeclareBody::DeclareSubscriber(m) => Some(&m.wire_expr),
-                DeclareBody::UndeclareSubscriber(m) => Some(&m.ext_wire_expr.wire_expr),
-                DeclareBody::DeclareQueryable(m) => Some(&m.wire_expr),
-                DeclareBody::UndeclareQueryable(m) => Some(&m.ext_wire_expr.wire_expr),
-                DeclareBody::DeclareToken(m) => Some(&m.wire_expr),
-                DeclareBody::UndeclareToken(m) => Some(&m.ext_wire_expr.wire_expr),
-                DeclareBody::DeclareInterest(m) => Some(&m.wire_expr),
-                DeclareBody::FinalInterest(_) => None,
-                DeclareBody::UndeclareInterest(m) => Some(&m.ext_wire_expr.wire_expr),
-            },
-            NetworkBody::OAM(_) => None,
-        }
+        self.msg.wire_expr()
     }
 
     #[inline]
@@ -158,7 +148,6 @@ impl RoutingContext<NetworkMessage> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn full_expr(&self) -> Option<&str> {
         if self.full_expr.get().is_some() {
             return Some(self.full_expr.get().as_ref().unwrap());
@@ -166,15 +155,15 @@ impl RoutingContext<NetworkMessage> {
         if let Some(prefix) = self.prefix() {
             let _ = self
                 .full_expr
-                .set(prefix.expr() + self.wire_expr().unwrap().suffix.as_ref());
+                .set(prefix.expr().to_string() + self.wire_expr().unwrap().suffix.as_ref());
             return Some(self.full_expr.get().as_ref().unwrap());
         }
         None
     }
 
     #[inline]
-    pub(crate) fn full_key_expr(&self) -> Option<OwnedKeyExpr> {
+    pub(crate) fn full_keyexpr(&self) -> Option<&keyexpr> {
         let full_expr = self.full_expr()?;
-        OwnedKeyExpr::new(full_expr).ok()
+        keyexpr::new(full_expr).ok()
     }
 }

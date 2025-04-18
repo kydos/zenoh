@@ -16,33 +16,39 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 mod adminspace;
 pub mod orchestrator;
 
-use super::primitives::DeMux;
-use super::routing;
-use super::routing::router::Router;
-use crate::config::{unwrap_or_default, Config, ModeDependent, Notifier};
-#[cfg(all(feature = "unstable", feature = "plugins"))]
-use crate::plugins::sealed::PluginsManager;
-use crate::{GIT_VERSION, LONG_VERSION};
-pub use adminspace::AdminSpace;
-use futures::stream::StreamExt;
-use futures::Future;
-use std::any::Any;
-use std::sync::{Arc, Weak};
-#[cfg(all(feature = "unstable", feature = "plugins"))]
+#[cfg(feature = "plugins")]
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::{
+    any::Any,
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Weak,
+    },
+};
+
+pub use adminspace::AdminSpace;
+use async_trait::async_trait;
+use futures::{stream::StreamExt, Future};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uhlc::{HLCBuilder, HLC};
+use zenoh_config::{unwrap_or_default, ModeDependent, ZenohId};
 use zenoh_link::{EndPoint, Link};
 use zenoh_plugin_trait::{PluginStartArgs, StructVersion};
-use zenoh_protocol::core::{Locator, WhatAmI, ZenohId};
-use zenoh_protocol::network::NetworkMessage;
+use zenoh_protocol::{
+    core::{Locator, WhatAmI, ZenohIdProto},
+    network::NetworkMessageMut,
+};
 use zenoh_result::{bail, ZResult};
+#[cfg(feature = "shared-memory")]
+use zenoh_shm::api::client_storage::ShmClientStorage;
+#[cfg(feature = "shared-memory")]
+use zenoh_shm::reader::ShmReader;
 use zenoh_sync::get_mut_unchecked;
 use zenoh_task::TaskController;
 use zenoh_transport::{
@@ -50,10 +56,26 @@ use zenoh_transport::{
     TransportManager, TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler,
 };
 
+use self::orchestrator::StartConditions;
+use super::{primitives::DeMux, routing, routing::router::Router};
+#[cfg(feature = "plugins")]
+use crate::api::loader::{load_plugins, start_plugins};
+#[cfg(feature = "plugins")]
+use crate::api::plugins::PluginsManager;
+#[cfg(feature = "internal")]
+use crate::session::CloseBuilder;
+use crate::{
+    api::{
+        builders::close::{Closeable, Closee},
+        config::{Config, Notifier},
+    },
+    GIT_VERSION, LONG_VERSION,
+};
+
 pub(crate) struct RuntimeState {
     zid: ZenohId,
     whatami: WhatAmI,
-    metadata: serde_json::Value,
+    next_id: AtomicU32,
     router: Arc<Router>,
     config: Notifier<Config>,
     manager: TransportManager,
@@ -61,8 +83,10 @@ pub(crate) struct RuntimeState {
     locators: std::sync::RwLock<Vec<Locator>>,
     hlc: Option<Arc<HLC>>,
     task_controller: TaskController,
-    #[cfg(all(feature = "unstable", feature = "plugins"))]
+    #[cfg(feature = "plugins")]
     plugins_manager: Mutex<PluginsManager>,
+    start_conditions: Arc<StartConditions>,
+    pending_connections: tokio::sync::Mutex<HashSet<ZenohIdProto>>,
 }
 
 pub struct WeakRuntime {
@@ -76,39 +100,50 @@ impl WeakRuntime {
 }
 
 pub struct RuntimeBuilder {
-    config: Config,
-    #[cfg(all(feature = "unstable", feature = "plugins"))]
+    config: zenoh_config::Config,
+    #[cfg(feature = "plugins")]
     plugins_manager: Option<PluginsManager>,
+    #[cfg(feature = "shared-memory")]
+    shm_clients: Option<Arc<ShmClientStorage>>,
 }
 
 impl RuntimeBuilder {
     pub fn new(config: Config) -> Self {
         Self {
-            config,
-            #[cfg(all(feature = "unstable", feature = "plugins"))]
+            config: config.0,
+            #[cfg(feature = "plugins")]
             plugins_manager: None,
+            #[cfg(feature = "shared-memory")]
+            shm_clients: None,
         }
     }
 
-    #[cfg(all(feature = "unstable", feature = "plugins"))]
+    #[cfg(all(feature = "plugins", feature = "internal"))]
     pub fn plugins_manager<T: Into<Option<PluginsManager>>>(mut self, plugins_manager: T) -> Self {
         self.plugins_manager = plugins_manager.into();
+        self
+    }
+
+    #[cfg(feature = "shared-memory")]
+    pub fn shm_clients(mut self, shm_clients: Option<Arc<ShmClientStorage>>) -> Self {
+        self.shm_clients = shm_clients;
         self
     }
 
     pub async fn build(self) -> ZResult<Runtime> {
         let RuntimeBuilder {
             config,
-            #[cfg(all(feature = "unstable", feature = "plugins"))]
+            #[cfg(feature = "plugins")]
             mut plugins_manager,
+            #[cfg(feature = "shared-memory")]
+            shm_clients,
         } = self;
 
         tracing::debug!("Zenoh Rust API {}", GIT_VERSION);
-        let zid = *config.id();
+        let zid = (*config.id()).into();
         tracing::info!("Using ZID: {}", zid);
 
         let whatami = unwrap_or_default!(config.mode());
-        let metadata = config.metadata().clone();
         let hlc = (*unwrap_or_default!(config.timestamping().enabled().get(whatami)))
             .then(|| Arc::new(HLCBuilder::new().with_id(uhlc::ID::from(&zid)).build()));
 
@@ -118,27 +153,35 @@ impl RuntimeBuilder {
             runtime: std::sync::RwLock::new(WeakRuntime { state: Weak::new() }),
         });
 
-        let transport_manager = TransportManager::builder()
+        let transport_manager_builder = TransportManager::builder()
             .from_config(&config)
             .await?
             .whatami(whatami)
-            .zid(zid)
-            .build(handler.clone())?;
+            .zid(zid);
+
+        #[cfg(feature = "shared-memory")]
+        let transport_manager_builder =
+            transport_manager_builder.shm_reader(shm_clients.map(ShmReader::new));
+
+        let transport_manager = transport_manager_builder.build(handler.clone())?;
 
         // Plugins manager
-        #[cfg(all(feature = "unstable", feature = "plugins"))]
+        #[cfg(feature = "plugins")]
         let plugins_manager = plugins_manager
             .take()
-            .unwrap_or_else(|| crate::plugins::loader::load_plugins(&config));
+            .unwrap_or_else(|| load_plugins(&config));
         // Admin space creation flag
         let start_admin_space = *config.adminspace.enabled();
+        // SHM lazy init flag
+        #[cfg(feature = "shared-memory")]
+        let shm_init_mode = *config.transport.shared_memory.mode();
 
-        let config = Notifier::new(config);
+        let config = Notifier::new(crate::config::Config(config));
         let runtime = Runtime {
             state: Arc::new(RuntimeState {
-                zid,
+                zid: zid.into(),
                 whatami,
-                metadata,
+                next_id: AtomicU32::new(1), // 0 is reserved for routing core
                 router,
                 config: config.clone(),
                 manager: transport_manager,
@@ -146,12 +189,14 @@ impl RuntimeBuilder {
                 locators: std::sync::RwLock::new(vec![]),
                 hlc,
                 task_controller: TaskController::default(),
-                #[cfg(all(feature = "unstable", feature = "plugins"))]
+                #[cfg(feature = "plugins")]
                 plugins_manager: Mutex::new(plugins_manager),
+                start_conditions: Arc::new(StartConditions::default()),
+                pending_connections: tokio::sync::Mutex::new(HashSet::new()),
             }),
         };
         *handler.runtime.write().unwrap() = Runtime::downgrade(&runtime);
-        get_mut_unchecked(&mut runtime.state.router.clone()).init_link_state(runtime.clone());
+        get_mut_unchecked(&mut runtime.state.router.clone()).init_link_state(runtime.clone())?;
 
         // Admin space
         if start_admin_space {
@@ -159,8 +204,8 @@ impl RuntimeBuilder {
         }
 
         // Start plugins
-        #[cfg(all(feature = "unstable", feature = "plugins"))]
-        crate::plugins::loader::start_plugins(&runtime);
+        #[cfg(feature = "plugins")]
+        start_plugins(&runtime);
 
         // Start notifier task
         let receiver = config.subscribe();
@@ -189,6 +234,12 @@ impl RuntimeBuilder {
             }
         });
 
+        #[cfg(feature = "shared-memory")]
+        match shm_init_mode {
+            zenoh_config::ShmInitMode::Init => zenoh_shm::init::init(),
+            zenoh_config::ShmInitMode::Lazy => {}
+        };
+
         Ok(runtime)
     }
 }
@@ -215,9 +266,9 @@ impl Runtime {
         &self.state.manager
     }
 
-    #[cfg(all(feature = "unstable", feature = "plugins"))]
+    #[cfg(feature = "plugins")]
     #[inline(always)]
-    pub(crate) fn plugins_manager(&self) -> MutexGuard<'_, PluginsManager> {
+    pub fn plugins_manager(&self) -> MutexGuard<'_, PluginsManager> {
         zlock!(self.state.plugins_manager)
     }
 
@@ -225,29 +276,21 @@ impl Runtime {
         zwrite!(self.state.transport_handlers).push(handler);
     }
 
-    pub async fn close(&self) -> ZResult<()> {
-        tracing::trace!("Runtime::close())");
-        // TODO: Plugins should be stopped
-        // TODO: Check this whether is able to terminate all spawned task by Runtime::spawn
+    #[inline]
+    pub fn next_id(&self) -> u32 {
+        self.state.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "internal")]
+    pub fn close(&self) -> CloseBuilder<Self> {
+        CloseBuilder::new(self)
+    }
+
+    pub fn is_closed(&self) -> bool {
         self.state
             .task_controller
-            .terminate_all(Duration::from_secs(10));
-        self.manager().close().await;
-        // clean up to break cyclic reference of self.state to itself
-        self.state.transport_handlers.write().unwrap().clear();
-        // TODO: the call below is needed to prevent intermittent leak
-        // due to not freed resource Arc, that apparently happens because
-        // the task responsible for resource clean up was aborted earlier than expected.
-        // This should be resolved by identfying correspodning task, and placing
-        // cancellation token manually inside it.
-        self.router()
-            .tables
-            .tables
-            .write()
-            .unwrap()
-            .root_res
-            .close();
-        Ok(())
+            .get_cancellation_token()
+            .is_cancelled()
     }
 
     pub fn new_timestamp(&self) -> Option<uhlc::Timestamp> {
@@ -310,6 +353,18 @@ impl Runtime {
 
     pub fn get_cancellation_token(&self) -> CancellationToken {
         self.state.task_controller.get_cancellation_token()
+    }
+
+    pub(crate) fn start_conditions(&self) -> &Arc<StartConditions> {
+        &self.state.start_conditions
+    }
+
+    pub(crate) async fn insert_pending_connection(&self, zid: ZenohIdProto) -> bool {
+        self.state.pending_connections.lock().await.insert(zid)
+    }
+
+    pub(crate) async fn remove_pending_connection(&self, zid: &ZenohIdProto) -> bool {
+        self.state.pending_connections.lock().await.remove(zid)
     }
 }
 
@@ -381,7 +436,7 @@ pub(super) struct RuntimeSession {
 }
 
 impl TransportPeerEventHandler for RuntimeSession {
-    fn handle_message(&self, msg: NetworkMessage) -> ZResult<()> {
+    fn handle_message(&self, msg: NetworkMessageMut) -> ZResult<()> {
         self.main_handler.handle_message(msg)
     }
 
@@ -399,16 +454,9 @@ impl TransportPeerEventHandler for RuntimeSession {
         }
     }
 
-    fn closing(&self) {
-        self.main_handler.closing();
-        Runtime::closing_session(self);
-        for handler in &self.slave_handlers {
-            handler.closing();
-        }
-    }
-
     fn closed(&self) {
         self.main_handler.closed();
+        Runtime::closed_session(self);
         for handler in &self.slave_handlers {
             handler.closed();
         }
@@ -442,12 +490,6 @@ impl TransportMulticastEventHandler for RuntimeMulticastGroup {
         }))
     }
 
-    fn closing(&self) {
-        for handler in &self.slave_handlers {
-            handler.closed();
-        }
-    }
-
     fn closed(&self) {
         for handler in &self.slave_handlers {
             handler.closed();
@@ -465,7 +507,7 @@ pub(super) struct RuntimeMulticastSession {
 }
 
 impl TransportPeerEventHandler for RuntimeMulticastSession {
-    fn handle_message(&self, msg: NetworkMessage) -> ZResult<()> {
+    fn handle_message(&self, msg: NetworkMessageMut) -> ZResult<()> {
         self.main_handler.handle_message(msg)
     }
 
@@ -483,13 +525,6 @@ impl TransportPeerEventHandler for RuntimeMulticastSession {
         }
     }
 
-    fn closing(&self) {
-        self.main_handler.closing();
-        for handler in &self.slave_handlers {
-            handler.closing();
-        }
-    }
-
     fn closed(&self) {
         self.main_handler.closed();
         for handler in &self.slave_handlers {
@@ -499,5 +534,34 @@ impl TransportPeerEventHandler for RuntimeMulticastSession {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[async_trait]
+impl Closee for Arc<RuntimeState> {
+    async fn close_inner(&self) {
+        tracing::trace!("Runtime::close())");
+        // TODO: Plugins should be stopped
+        // TODO: Check this whether is able to terminate all spawned task by Runtime::spawn
+        self.task_controller.terminate_all_async().await;
+        self.manager.close().await;
+        // clean up to break cyclic reference of self.state to itself
+        self.transport_handlers.write().unwrap().clear();
+        // TODO: the call below is needed to prevent intermittent leak
+        // due to not freed resource Arc, that apparently happens because
+        // the task responsible for resource clean up was aborted earlier than expected.
+        // This should be resolved by identfying correspodning task, and placing
+        // cancellation token manually inside it.
+        let mut tables = self.router.tables.tables.write().unwrap();
+        tables.root_res.close();
+        tables.faces.clear();
+    }
+}
+
+impl Closeable for Runtime {
+    type TClosee = Arc<RuntimeState>;
+
+    fn get_closee(&self) -> Self::TClosee {
+        self.state.clone()
     }
 }

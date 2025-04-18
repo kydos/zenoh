@@ -11,27 +11,28 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::{cell::UnsafeCell, convert::TryInto, fmt, net::SocketAddr, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
-use std::cell::UnsafeCell;
-use std::convert::TryInto;
-use std::fmt;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use tokio_util::sync::CancellationToken;
 use zenoh_link_commons::{
-    get_ip_interface_names, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait,
-    ListenersUnicastIP, NewLinkChannelSender, BIND_INTERFACE,
+    get_ip_interface_names, tcp::TcpSocketConfig, LinkAuthId, LinkManagerUnicastTrait, LinkUnicast,
+    LinkUnicastTrait, ListenersUnicastIP, NewLinkChannelSender, BIND_INTERFACE, BIND_SOCKET,
 };
-use zenoh_protocol::core::{EndPoint, Locator};
+use zenoh_protocol::{
+    core::{EndPoint, Locator},
+    transport::BatchSize,
+};
 use zenoh_result::{bail, zerror, Error as ZError, ZResult};
 
-use super::{
-    get_tcp_addrs, TCP_ACCEPT_THROTTLE_TIME, TCP_DEFAULT_MTU, TCP_LINGER_TIMEOUT,
-    TCP_LOCATOR_PREFIX,
+use crate::{
+    get_tcp_addrs, utils::TcpLinkConfig, TCP_ACCEPT_THROTTLE_TIME, TCP_DEFAULT_MTU,
+    TCP_LINGER_TIMEOUT, TCP_LOCATOR_PREFIX,
 };
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 pub struct LinkUnicastTcp {
     // The underlying socket as returned from the tokio library
@@ -42,6 +43,8 @@ pub struct LinkUnicastTcp {
     // The destination socket address of this link (address used on the remote host)
     dst_addr: SocketAddr,
     dst_locator: Locator,
+    // The computed mtu
+    mtu: BatchSize,
 }
 
 unsafe impl Sync for LinkUnicastTcp {}
@@ -70,6 +73,29 @@ impl LinkUnicastTcp {
             );
         }
 
+        // Compute the MTU
+        // See IETF RFC6691: https://datatracker.ietf.org/doc/rfc6691/
+        let header = match src_addr.ip() {
+            std::net::IpAddr::V4(_) => 40,
+            std::net::IpAddr::V6(_) => 60,
+        };
+        #[allow(unused_mut)] // mut is not needed when target_family != unix
+        let mut mtu = *TCP_DEFAULT_MTU - header;
+
+        // target limitation of socket2: https://docs.rs/socket2/latest/src/socket2/sys/unix.rs.html#1544
+        #[cfg(target_family = "unix")]
+        {
+            let socket = socket2::SockRef::from(&socket);
+            // Get the MSS and divide it by 2 to ensure we can at least fill half the MSS
+            let mss = socket.mss().unwrap_or(mtu as u32) / 2;
+            // Compute largest multiple of TCP MSS that is smaller of default MTU
+            let mut tgt = mss;
+            while (tgt + mss) < mtu as u32 {
+                tgt += mss;
+            }
+            mtu = (mtu as u32).min(tgt) as BatchSize;
+        }
+
         // Build the Tcp object
         LinkUnicastTcp {
             socket: UnsafeCell::new(socket),
@@ -77,8 +103,10 @@ impl LinkUnicastTcp {
             src_locator: Locator::new(TCP_LOCATOR_PREFIX, src_addr.to_string(), "").unwrap(),
             dst_addr,
             dst_locator: Locator::new(TCP_LOCATOR_PREFIX, dst_addr.to_string(), "").unwrap(),
+            mtu,
         }
     }
+
     #[allow(clippy::mut_from_ref)]
     fn get_mut_socket(&self) -> &mut TcpStream {
         unsafe { &mut *self.socket.get() }
@@ -145,8 +173,8 @@ impl LinkUnicastTrait for LinkUnicastTcp {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
-        *TCP_DEFAULT_MTU
+    fn get_mtu(&self) -> BatchSize {
+        self.mtu
     }
 
     #[inline(always)]
@@ -156,12 +184,17 @@ impl LinkUnicastTrait for LinkUnicastTcp {
 
     #[inline(always)]
     fn is_reliable(&self) -> bool {
-        true
+        super::IS_RELIABLE
     }
 
     #[inline(always)]
     fn is_streamed(&self) -> bool {
         true
+    }
+
+    #[inline(always)]
+    fn get_auth_id(&self) -> &LinkAuthId {
+        &LinkAuthId::Tcp
     }
 }
 
@@ -189,6 +222,7 @@ impl fmt::Debug for LinkUnicastTcp {
         f.debug_struct("Tcp")
             .field("src", &self.src_addr)
             .field("dst", &self.dst_addr)
+            .field("mtu", &self.get_mtu())
             .finish()
     }
 }
@@ -207,80 +241,33 @@ impl LinkManagerUnicastTcp {
     }
 }
 
-impl LinkManagerUnicastTcp {
-    async fn new_link_inner(
-        &self,
-        dst_addr: &SocketAddr,
-        iface: Option<&str>,
-    ) -> ZResult<(TcpStream, SocketAddr, SocketAddr)> {
-        let socket = match dst_addr {
-            SocketAddr::V4(_) => TcpSocket::new_v4(),
-            SocketAddr::V6(_) => TcpSocket::new_v6(),
-        }?;
-
-        if let Some(iface) = iface {
-            zenoh_util::net::set_bind_to_device_tcp_socket(&socket, iface)?;
-        }
-
-        // Build a TcpStream from TcpSocket
-        // https://docs.rs/tokio/latest/tokio/net/struct.TcpSocket.html
-        let stream = socket
-            .connect(*dst_addr)
-            .await
-            .map_err(|e| zerror!("{}: {}", dst_addr, e))?;
-
-        let src_addr = stream
-            .local_addr()
-            .map_err(|e| zerror!("{}: {}", dst_addr, e))?;
-
-        let dst_addr = stream
-            .peer_addr()
-            .map_err(|e| zerror!("{}: {}", dst_addr, e))?;
-
-        Ok((stream, src_addr, dst_addr))
-    }
-
-    async fn new_listener_inner(
-        &self,
-        addr: &SocketAddr,
-        iface: Option<&str>,
-    ) -> ZResult<(TcpListener, SocketAddr)> {
-        let socket = match addr {
-            SocketAddr::V4(_) => TcpSocket::new_v4(),
-            SocketAddr::V6(_) => TcpSocket::new_v6(),
-        }?;
-
-        if let Some(iface) = iface {
-            zenoh_util::net::set_bind_to_device_tcp_socket(&socket, iface)?;
-        }
-
-        // Build a TcpListener from TcpSocket
-        // https://docs.rs/tokio/latest/tokio/net/struct.TcpSocket.html
-        socket.set_reuseaddr(true)?;
-        socket.bind(*addr).map_err(|e| zerror!("{}: {}", addr, e))?;
-        // backlog (the maximum number of pending connections are queued): 1024
-        let listener = socket
-            .listen(1024)
-            .map_err(|e| zerror!("{}: {}", addr, e))?;
-
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| zerror!("{}: {}", addr, e))?;
-
-        Ok((listener, local_addr))
-    }
-}
-
 #[async_trait]
 impl LinkManagerUnicastTrait for LinkManagerUnicastTcp {
     async fn new_link(&self, endpoint: EndPoint) -> ZResult<LinkUnicast> {
         let dst_addrs = get_tcp_addrs(endpoint.address()).await?;
+
         let config = endpoint.config();
-        let iface = config.get(BIND_INTERFACE);
+
+        // if both `iface`, and `bind` are present, return error
+        if let (Some(_), Some(_)) = (config.get(BIND_INTERFACE), config.get(BIND_SOCKET)) {
+            bail!(
+                "Using Config options `iface` and `bind` in conjunction is unsupported at this time {} {:?}",
+                BIND_INTERFACE,
+                BIND_SOCKET
+            )
+        }
+
+        let link_config = TcpLinkConfig::new(&config).await?;
+        let socket_config = TcpSocketConfig::new(
+            link_config.tx_buffer_size,
+            link_config.rx_buffer_size,
+            link_config.bind_iface,
+            link_config.bind_socket,
+        );
 
         let mut errs: Vec<ZError> = vec![];
         for da in dst_addrs {
-            match self.new_link_inner(&da, iface).await {
+            match socket_config.new_link(&da).await {
                 Ok((stream, src_addr, dst_addr)) => {
                     let link = Arc::new(LinkUnicastTcp::new(stream, src_addr, dst_addr));
                     return Ok(LinkUnicast(link));
@@ -304,26 +291,32 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTcp {
 
     async fn new_listener(&self, mut endpoint: EndPoint) -> ZResult<Locator> {
         let addrs = get_tcp_addrs(endpoint.address()).await?;
+
         let config = endpoint.config();
-        let iface = config.get(BIND_INTERFACE);
+
+        let link_config = TcpLinkConfig::new(&config).await?;
+        let socket_config: TcpSocketConfig<'_> = link_config.into();
 
         let mut errs: Vec<ZError> = vec![];
         for da in addrs {
-            match self.new_listener_inner(&da, iface).await {
+            match socket_config.new_listener(&da) {
                 Ok((socket, local_addr)) => {
                     // Update the endpoint locator address
                     endpoint = EndPoint::new(
                         endpoint.protocol(),
-                        &format!("{local_addr}"),
+                        format!("{local_addr}"),
                         endpoint.metadata(),
                         endpoint.config(),
                     )?;
 
                     let token = self.listeners.token.child_token();
-                    let c_token = token.clone();
 
-                    let c_manager = self.manager.clone();
-                    let task = async move { accept_task(socket, c_token, c_manager).await };
+                    let task = {
+                        let token = token.clone();
+                        let manager = self.manager.clone();
+
+                        async move { accept_task(socket, token, manager).await }
+                    };
 
                     let locator = endpoint.to_locator();
                     self.listeners

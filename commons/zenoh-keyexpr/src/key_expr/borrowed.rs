@@ -12,19 +12,22 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use super::{canon::Canonizable, OwnedKeyExpr, FORBIDDEN_CHARS};
+#[cfg(feature = "internal")]
+use alloc::vec::Vec;
 use alloc::{
     borrow::{Borrow, ToOwned},
     format,
     string::String,
-    vec::Vec,
 };
 use core::{
     convert::{TryFrom, TryInto},
     fmt,
     ops::{Deref, Div},
 };
+
 use zenoh_result::{bail, Error as ZError, ZResult};
+
+use super::{canon::Canonize, OwnedKeyExpr, OwnedNonWildKeyExpr, FORBIDDEN_CHARS};
 
 /// A [`str`] newtype that is statically known to be a valid key expression.
 ///
@@ -69,7 +72,7 @@ impl keyexpr {
     pub fn autocanonize<'a, T, E>(t: &'a mut T) -> Result<&'a Self, E>
     where
         &'a Self: TryFrom<&'a T, Error = E>,
-        T: Canonizable + ?Sized,
+        T: Canonize + ?Sized,
     {
         t.canonize();
         Self::new(t)
@@ -90,6 +93,7 @@ impl keyexpr {
     /// Returns the relation between `self` and `other` from `self`'s point of view ([`SetIntersectionLevel::Includes`] signifies that `self` includes `other`).
     ///
     /// Note that this is slower than [`keyexpr::intersects`] and [`keyexpr::includes`], so you should favor these methods for most applications.
+    #[cfg(feature = "unstable")]
     pub fn relation_to(&self, other: &Self) -> SetIntersectionLevel {
         use SetIntersectionLevel::*;
         if self.intersects(other) {
@@ -124,7 +128,12 @@ impl keyexpr {
     }
 
     /// Returns `true` if `self` contains any wildcard character (`**` or `$*`).
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
     pub fn is_wild(&self) -> bool {
+        self.is_wild_impl()
+    }
+    pub(crate) fn is_wild_impl(&self) -> bool {
         self.0.contains(super::SINGLE_WILD as char)
     }
 
@@ -161,6 +170,8 @@ impl keyexpr {
     ///     None,
     ///     keyexpr::new("dem$*").unwrap().get_nonwild_prefix());
     /// ```
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
     pub fn get_nonwild_prefix(&self) -> Option<&keyexpr> {
         match self.0.find('*') {
             Some(i) => match self.0[..i].rfind('/') {
@@ -176,6 +187,7 @@ impl keyexpr {
     /// For instance, if `self` is `"a/**/c/*" and `prefix` is `a/b/c` then:  
     ///   - the `prefix` matches `"a/**/c"` leading to a result of `"*"` when stripped from `self`
     ///   - the `prefix` matches `"a/**"` leading to a result of `"**/c/*"` when stripped from `self`
+    ///
     /// So the result is `["*", "**/c/*"]`.  
     /// If `prefix` cannot match the beginning of `self`, an empty list is reuturned.
     ///
@@ -225,6 +237,8 @@ impl keyexpr {
     ///     keyexpr::new("demo/example/test/**").unwrap().strip_prefix(keyexpr::new("not/a/prefix").unwrap()).is_empty()
     /// );
     /// ```
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
     pub fn strip_prefix(&self, prefix: &Self) -> Vec<&keyexpr> {
         let mut result = alloc::vec![];
         'chunks: for i in (0..=self.len()).rev() {
@@ -269,6 +283,134 @@ impl keyexpr {
         result
     }
 
+    /// Remove the specified namespace `prefix` from `self`.
+    ///
+    /// This method works essentially like [`keyexpr::strip_prefix()`], but returns only the longest possible suffix.
+    /// Prefix can not contain '*' character.
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
+    pub fn strip_nonwild_prefix(&self, prefix: &nonwild_keyexpr) -> Option<&keyexpr> {
+        fn is_chunk_matching(target: &[u8], prefix: &[u8]) -> bool {
+            let mut target_idx: usize = 0;
+            let mut prefix_idx: usize = 0;
+            let mut target_prev: u8 = b'/';
+            if prefix.first() == Some(&b'@') && target.first() != Some(&b'@') {
+                // verbatim chunk can only be matched by verbatim chunk
+                return false;
+            }
+
+            while target_idx < target.len() && prefix_idx < prefix.len() {
+                if target[target_idx] == b'*' {
+                    if target_prev == b'*' || target_idx + 1 == target.len() {
+                        // either a ** wild chunk or a single * chunk at the end of the string - this matches anything
+                        return true;
+                    } else if target_prev == b'$' {
+                        for i in prefix_idx..prefix.len() - 1 {
+                            if is_chunk_matching(&target[target_idx + 1..], &prefix[i..]) {
+                                return true;
+                            }
+                        }
+                    }
+                } else if target[target_idx] == prefix[prefix_idx] {
+                    prefix_idx += 1;
+                } else if target[target_idx] != b'$' {
+                    // non-special character, which do not match the one in prefix
+                    return false;
+                }
+                target_prev = target[target_idx];
+                target_idx += 1;
+            }
+            if prefix_idx != prefix.len() {
+                // prefix was not matched entirely
+                return false;
+            }
+            target_idx == target.len()
+                || (target_idx + 2 == target.len() && target[target_idx] == b'$')
+        }
+
+        fn strip_nonwild_prefix_inner<'a>(
+            target_bytes: &'a [u8],
+            prefix_bytes: &[u8],
+        ) -> Option<&'a keyexpr> {
+            let mut target_idx = 0;
+            let mut prefix_idx = 0;
+
+            while target_idx < target_bytes.len() && prefix_idx < prefix_bytes.len() {
+                let target_end = target_idx
+                    + target_bytes[target_idx..]
+                        .iter()
+                        .position(|&i| i == b'/')
+                        .unwrap_or(target_bytes.len() - target_idx);
+                let prefix_end = prefix_idx
+                    + prefix_bytes[prefix_idx..]
+                        .iter()
+                        .position(|&i| i == b'/')
+                        .unwrap_or(prefix_bytes.len() - prefix_idx);
+                let target_chunk = &target_bytes[target_idx..target_end];
+                if target_chunk.len() == 2 && target_chunk[0] == b'*' {
+                    let remaining_prefix = &prefix_bytes[prefix_idx..];
+                    return match remaining_prefix.iter().position(|&x| x == b'@') {
+                        Some(mut p) => {
+                            if target_end + 1 >= target_bytes.len() {
+                                // "**" is the last chunk, and it is not allowed to match @verbatim chunks, so we stop here
+                                return None;
+                            } else {
+                                loop {
+                                    // try to use "**" to match as many non-verbatim chunks as possible
+                                    if let Some(ke) = strip_nonwild_prefix_inner(
+                                        &target_bytes[(target_end + 1)..],
+                                        &remaining_prefix[p..],
+                                    ) {
+                                        return Some(ke);
+                                    } else if p == 0 {
+                                        // "**" is not allowed to match @verbatim chunks
+                                        return None;
+                                    } else {
+                                        // search for the beginning of the next chunk from the end
+                                        p -= 2;
+                                        while p > 0 && remaining_prefix[p - 1] != b'/' {
+                                            p -= 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => unsafe {
+                            // "**" can match all remaining non-verbatim chunks
+                            Some(keyexpr::from_str_unchecked(core::str::from_utf8_unchecked(
+                                &target_bytes[target_idx..],
+                            )))
+                        },
+                    };
+                }
+                if target_end == target_bytes.len() {
+                    // target contains no more chunks than prefix and the last one is non double-wild - so it can not match
+                    return None;
+                }
+                let prefix_chunk = &prefix_bytes[prefix_idx..prefix_end];
+                if !is_chunk_matching(target_chunk, prefix_chunk) {
+                    return None;
+                }
+                if prefix_end == prefix_bytes.len() {
+                    // Safety: every chunk of keyexpr is also a valid keyexpr
+                    return unsafe {
+                        Some(keyexpr::from_str_unchecked(core::str::from_utf8_unchecked(
+                            &target_bytes[(target_end + 1)..],
+                        )))
+                    };
+                }
+                target_idx = target_end + 1;
+                prefix_idx = prefix_end + 1;
+            }
+            None
+        }
+
+        let target_bytes = self.0.as_bytes();
+        let prefix_bytes = prefix.0.as_bytes();
+
+        strip_nonwild_prefix_inner(target_bytes, prefix_bytes)
+    }
+
     pub const fn as_str(&self) -> &str {
         &self.0
     }
@@ -290,7 +432,13 @@ impl keyexpr {
     pub unsafe fn from_slice_unchecked(s: &[u8]) -> &Self {
         core::mem::transmute(s)
     }
+
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
     pub const fn chunks(&self) -> Chunks {
+        self.chunks_impl()
+    }
+    pub(crate) const fn chunks_impl(&self) -> Chunks {
         Chunks {
             inner: self.as_str(),
         }
@@ -525,7 +673,7 @@ impl<'a> Iterator for Chunks<'a> {
         Some(unsafe { keyexpr::from_str_unchecked(next) })
     }
 }
-impl<'a> DoubleEndedIterator for Chunks<'a> {
+impl DoubleEndedIterator for Chunks<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.inner.is_empty() {
             return None;
@@ -549,6 +697,7 @@ impl Div for &keyexpr {
 ///
 /// You can check for intersection with `level >= SetIntersecionLevel::Intersection` and for inclusion with `level >= SetIntersectionLevel::Includes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg(feature = "unstable")]
 pub enum SetIntersectionLevel {
     Disjoint,
     Intersects,
@@ -738,6 +887,66 @@ impl ToOwned for keyexpr {
     }
 }
 
+/// A keyexpr that is statically known not to contain any wild chunks.
+#[allow(non_camel_case_types)]
+#[repr(transparent)]
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct nonwild_keyexpr(keyexpr);
+
+impl nonwild_keyexpr {
+    /// Attempts to construct a non-wild key expression from anything convertible to keyexpression.
+    ///
+    /// Will return an Err if `t` isn't a valid key expression.
+    pub fn new<'a, T, E>(t: &'a T) -> Result<&'a Self, ZError>
+    where
+        &'a keyexpr: TryFrom<&'a T, Error = E>,
+        E: Into<ZError>,
+        T: ?Sized,
+    {
+        let ke: &'a keyexpr = t.try_into().map_err(|e: E| e.into())?;
+        ke.try_into()
+    }
+
+    /// # Safety
+    /// This constructs a [`nonwild_keyexpr`] without ensuring that it is a valid key-expression without wild chunks.
+    ///
+    /// Much like [`core::str::from_utf8_unchecked`], this is memory-safe, but calling this without maintaining
+    /// [`nonwild_keyexpr`]'s invariants yourself may lead to unexpected behaviors, the Zenoh network dropping your messages.
+    pub const unsafe fn from_str_unchecked(s: &str) -> &Self {
+        core::mem::transmute(s)
+    }
+}
+
+impl Deref for nonwild_keyexpr {
+    type Target = keyexpr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> TryFrom<&'a keyexpr> for &'a nonwild_keyexpr {
+    type Error = ZError;
+    fn try_from(value: &'a keyexpr) -> Result<Self, Self::Error> {
+        if value.is_wild_impl() {
+            bail!("nonwild_keyexpr can not contain any wild chunks")
+        }
+        Ok(unsafe { core::mem::transmute::<&keyexpr, &nonwild_keyexpr>(value) })
+    }
+}
+
+impl Borrow<nonwild_keyexpr> for OwnedNonWildKeyExpr {
+    fn borrow(&self) -> &nonwild_keyexpr {
+        self
+    }
+}
+
+impl ToOwned for nonwild_keyexpr {
+    type Owned = OwnedNonWildKeyExpr;
+    fn to_owned(&self) -> Self::Owned {
+        OwnedNonWildKeyExpr::from(self)
+    }
+}
+
 #[test]
 fn test_keyexpr_strip_prefix() {
     let expectations = [
@@ -776,5 +985,69 @@ fn test_keyexpr_strip_prefix() {
     for ((ke, prefix), expected) in expectations {
         dbg!(ke, prefix);
         assert_eq!(ke.strip_prefix(prefix), expected)
+    }
+}
+
+#[test]
+fn test_keyexpr_strip_nonwild_prefix() {
+    let expectations = [
+        (("demo/example/test/**", "demo/example/test"), Some("**")),
+        (("demo/example/**", "demo/example/test"), Some("**")),
+        (("**", "demo/example/test"), Some("**")),
+        (("*/example/test/1", "demo/example/test"), Some("1")),
+        (("demo/*/test/1", "demo/example/test"), Some("1")),
+        (("*/*/test/1", "demo/example/test"), Some("1")),
+        (("*/*/*/1", "demo/example/test"), Some("1")),
+        (("*/test/1", "demo/example/test"), None),
+        (("*/*/1", "demo/example/test"), None),
+        (("*/*/**", "demo/example/test"), Some("**")),
+        (
+            ("demo/example/test/**/x$*/**", "demo/example/test"),
+            Some("**/x$*/**"),
+        ),
+        (("demo/**/xyz", "demo/example/test"), Some("**/xyz")),
+        (("demo/**/test/**", "demo/example/test"), Some("**/test/**")),
+        (
+            ("demo/**/ex$*/*/xyz", "demo/example/test"),
+            Some("**/ex$*/*/xyz"),
+        ),
+        (
+            ("demo/**/ex$*/t$*/xyz", "demo/example/test"),
+            Some("**/ex$*/t$*/xyz"),
+        ),
+        (
+            ("demo/**/te$*/*/xyz", "demo/example/test"),
+            Some("**/te$*/*/xyz"),
+        ),
+        (("demo/example/test", "demo/example/test"), None),
+        (("demo/example/test1/something", "demo/example/test"), None),
+        (
+            ("demo/example/test$*/something", "demo/example/test"),
+            Some("something"),
+        ),
+        (("*/example/test/something", "@demo/example/test"), None),
+        (("**/test/something", "@demo/example/test"), None),
+        (("**/test/something", "demo/example/@test"), None),
+        (
+            ("@demo/*/test/something", "@demo/example/test"),
+            Some("something"),
+        ),
+        (("@demo/*/test/something", "@demo/@example/test"), None),
+        (("**/@demo/test/something", "@demo/test"), Some("something")),
+        (("**/@test/something", "demo/@test"), Some("something")),
+        (
+            ("@demo/**/@test/something", "@demo/example/@test"),
+            Some("something"),
+        ),
+    ]
+    .map(|((a, b), expected)| {
+        (
+            (keyexpr::new(a).unwrap(), nonwild_keyexpr::new(b).unwrap()),
+            expected.map(|t| keyexpr::new(t).unwrap()),
+        )
+    });
+    for ((ke, prefix), expected) in expectations {
+        dbg!(ke, prefix);
+        assert_eq!(ke.strip_nonwild_prefix(prefix), expected)
     }
 }

@@ -11,34 +11,32 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::TransportUnicastLowlatency;
 use zenoh_protocol::{
-    network::NetworkMessage,
-    transport::{TransportBodyLowLatency, TransportMessageLowLatency},
+    network::{NetworkMessageExt, NetworkMessageMut},
+    transport::{TransportBodyLowLatencyRef, TransportMessageLowLatencyRef},
 };
 #[cfg(feature = "shared-memory")]
 use zenoh_result::bail;
 use zenoh_result::ZResult;
 
+use super::transport::TransportUnicastLowlatency;
+#[cfg(feature = "shared-memory")]
+use crate::shm::map_zmsg_to_partner;
+
 impl TransportUnicastLowlatency {
     #[allow(unused_mut)] // When feature "shared-memory" is not enabled
     #[allow(clippy::let_and_return)] // When feature "stats" is not enabled
     #[inline(always)]
-    pub(crate) fn internal_schedule(&self, mut msg: NetworkMessage) -> ZResult<()> {
+    pub(crate) fn internal_schedule(&self, mut msg: NetworkMessageMut) -> ZResult<()> {
         #[cfg(feature = "shared-memory")]
         {
-            let res = if self.config.is_shm {
-                crate::shm::map_zmsg_to_shminfo(&mut msg)
-            } else {
-                crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.shm().reader)
-            };
-            if let Err(e) = res {
+            if let Err(e) = map_zmsg_to_partner(&mut msg, &self.config.shm) {
                 bail!("Failed SHM conversion: {}", e);
             }
         }
 
-        let msg = TransportMessageLowLatency {
-            body: TransportBodyLowLatency::Network(msg),
+        let msg = TransportMessageLowLatencyRef {
+            body: TransportBodyLowLatencyRef::Network(msg.as_ref()),
         };
         let res = self.send(msg);
 

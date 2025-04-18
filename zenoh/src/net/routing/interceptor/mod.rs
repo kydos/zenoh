@@ -16,32 +16,81 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 //!
 mod access_control;
 use access_control::acl_interceptor_factories;
+use nonempty_collections::NEVec;
+use zenoh_link::LinkAuthId;
 
 mod authorization;
-use super::RoutingContext;
-use crate::KeyExpr;
 use std::any::Any;
 
-use zenoh_config::Config;
-use zenoh_protocol::network::NetworkMessage;
+mod low_pass;
+use low_pass::low_pass_interceptor_factories;
+use zenoh_config::{Config, InterceptorFlow, InterceptorLink};
+use zenoh_keyexpr::{keyexpr, OwnedKeyExpr};
+use zenoh_protocol::network::NetworkMessageMut;
 use zenoh_result::ZResult;
 use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast};
+
+use super::RoutingContext;
 
 pub mod downsampling;
 use crate::net::routing::interceptor::downsampling::downsampling_interceptor_factories;
 
+pub mod qos_overwrite;
+use crate::net::routing::interceptor::qos_overwrite::qos_overwrite_interceptor_factories;
+
+#[derive(Default, Debug)]
+pub struct InterfaceEnabled {
+    pub ingress: bool,
+    pub egress: bool,
+}
+
+impl From<&NEVec<InterceptorFlow>> for InterfaceEnabled {
+    fn from(value: &NEVec<InterceptorFlow>) -> Self {
+        let mut res = Self {
+            ingress: false,
+            egress: false,
+        };
+        for v in value {
+            match v {
+                InterceptorFlow::Egress => res.egress = true,
+                InterceptorFlow::Ingress => res.ingress = true,
+            }
+        }
+        res
+    }
+}
+
+/// Wrapper for InterceptorLink in order to implement From trait.
+pub(crate) struct InterceptorLinkWrapper(pub(crate) InterceptorLink);
+
+impl From<&LinkAuthId> for InterceptorLinkWrapper {
+    fn from(value: &LinkAuthId) -> Self {
+        match value {
+            LinkAuthId::Tls(_) => Self(InterceptorLink::Tls),
+            LinkAuthId::Quic(_) => Self(InterceptorLink::Quic),
+            LinkAuthId::Tcp => Self(InterceptorLink::Tcp),
+            LinkAuthId::Udp => Self(InterceptorLink::Udp),
+            LinkAuthId::Serial => Self(InterceptorLink::Serial),
+            LinkAuthId::Unixpipe => Self(InterceptorLink::Unixpipe),
+            LinkAuthId::UnixsockStream => Self(InterceptorLink::UnixsockStream),
+            LinkAuthId::Vsock => Self(InterceptorLink::Vsock),
+            LinkAuthId::Ws => Self(InterceptorLink::Ws),
+        }
+    }
+}
+
 pub(crate) trait InterceptorTrait {
-    fn compute_keyexpr_cache(&self, key_expr: &KeyExpr<'_>) -> Option<Box<dyn Any + Send + Sync>>;
+    fn compute_keyexpr_cache(&self, key_expr: &keyexpr) -> Option<Box<dyn Any + Send + Sync>>;
 
     fn intercept(
         &self,
-        ctx: RoutingContext<NetworkMessage>,
+        ctx: &mut RoutingContext<NetworkMessageMut>,
         cache: Option<&Box<dyn Any + Send + Sync>>,
-    ) -> Option<RoutingContext<NetworkMessage>>;
+    ) -> bool;
 }
 
 pub(crate) type Interceptor = Box<dyn InterceptorTrait + Send + Sync>;
@@ -63,13 +112,24 @@ pub(crate) fn interceptor_factories(config: &Config) -> ZResult<Vec<InterceptorF
     let mut res: Vec<InterceptorFactory> = vec![];
     // Uncomment to log the interceptors initialisation
     // res.push(Box::new(LoggerInterceptor {}));
+    #[cfg(test)]
+    if let Some(test_interceptors) = tests::ID_TO_INTERCEPTOR_FACTORIES
+        .lock()
+        .unwrap()
+        .get(config.id())
+    {
+        res.extend((test_interceptors.as_ref())());
+    }
     res.extend(downsampling_interceptor_factories(config.downsampling())?);
     res.extend(acl_interceptor_factories(config.access_control())?);
+    res.extend(qos_overwrite_interceptor_factories(config.qos().network())?);
+    res.extend(low_pass_interceptor_factories(config.low_pass_filter())?);
     Ok(res)
 }
 
 pub(crate) struct InterceptorsChain {
     pub(crate) interceptors: Vec<Interceptor>,
+    pub(crate) version: usize,
 }
 
 impl InterceptorsChain {
@@ -77,18 +137,24 @@ impl InterceptorsChain {
     pub(crate) fn empty() -> Self {
         Self {
             interceptors: vec![],
+            version: 0,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.interceptors.is_empty()
+    }
+
+    pub(crate) fn new(interceptors: Vec<Interceptor>, version: usize) -> Self {
+        InterceptorsChain {
+            interceptors,
+            version,
         }
     }
 }
 
-impl From<Vec<Interceptor>> for InterceptorsChain {
-    fn from(interceptors: Vec<Interceptor>) -> Self {
-        InterceptorsChain { interceptors }
-    }
-}
-
 impl InterceptorTrait for InterceptorsChain {
-    fn compute_keyexpr_cache(&self, key_expr: &KeyExpr<'_>) -> Option<Box<dyn Any + Send + Sync>> {
+    fn compute_keyexpr_cache(&self, key_expr: &keyexpr) -> Option<Box<dyn Any + Send + Sync>> {
         Some(Box::new(
             self.interceptors
                 .iter()
@@ -99,24 +165,21 @@ impl InterceptorTrait for InterceptorsChain {
 
     fn intercept<'a>(
         &self,
-        mut ctx: RoutingContext<NetworkMessage>,
+        ctx: &mut RoutingContext<NetworkMessageMut>,
         caches: Option<&Box<dyn Any + Send + Sync>>,
-    ) -> Option<RoutingContext<NetworkMessage>> {
+    ) -> bool {
         let caches =
             caches.and_then(|i| i.downcast_ref::<Vec<Option<Box<dyn Any + Send + Sync>>>>());
         for (idx, interceptor) in self.interceptors.iter().enumerate() {
             let cache = caches
                 .and_then(|caches| caches.get(idx).map(|k| k.as_ref()))
                 .flatten();
-            match interceptor.intercept(ctx, cache) {
-                Some(newctx) => ctx = newctx,
-                None => {
-                    tracing::trace!("Msg intercepted!");
-                    return None;
-                }
+            if !interceptor.intercept(ctx, cache) {
+                tracing::trace!("Msg intercepted!");
+                return false;
             }
         }
-        Some(ctx)
+        true
     }
 }
 
@@ -133,43 +196,40 @@ impl<T: InterceptorTrait> ComputeOnMiss<T> {
 
 impl<T: InterceptorTrait> InterceptorTrait for ComputeOnMiss<T> {
     #[inline]
-    fn compute_keyexpr_cache(&self, key_expr: &KeyExpr<'_>) -> Option<Box<dyn Any + Send + Sync>> {
+    fn compute_keyexpr_cache(&self, key_expr: &keyexpr) -> Option<Box<dyn Any + Send + Sync>> {
         self.interceptor.compute_keyexpr_cache(key_expr)
     }
 
     #[inline]
     fn intercept<'a>(
         &self,
-        ctx: RoutingContext<NetworkMessage>,
+        ctx: &mut RoutingContext<NetworkMessageMut>,
         cache: Option<&Box<dyn Any + Send + Sync>>,
-    ) -> Option<RoutingContext<NetworkMessage>> {
+    ) -> bool {
         if cache.is_some() {
             self.interceptor.intercept(ctx, cache)
-        } else if let Some(key_expr) = ctx.full_key_expr() {
-            self.interceptor.intercept(
-                ctx,
-                self.interceptor
-                    .compute_keyexpr_cache(&key_expr.into())
-                    .as_ref(),
-            )
+        } else if let Some(key_expr) = ctx.full_keyexpr() {
+            let cache = self.interceptor.compute_keyexpr_cache(key_expr);
+            self.interceptor.intercept(ctx, cache.as_ref())
         } else {
             self.interceptor.intercept(ctx, cache)
         }
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct IngressMsgLogger {}
 
 impl InterceptorTrait for IngressMsgLogger {
-    fn compute_keyexpr_cache(&self, key_expr: &KeyExpr<'_>) -> Option<Box<dyn Any + Send + Sync>> {
-        Some(Box::new(key_expr.to_string()))
+    fn compute_keyexpr_cache(&self, key_expr: &keyexpr) -> Option<Box<dyn Any + Send + Sync>> {
+        Some(Box::new(OwnedKeyExpr::from(key_expr)))
     }
 
     fn intercept(
         &self,
-        ctx: RoutingContext<NetworkMessage>,
+        ctx: &mut RoutingContext<NetworkMessageMut>,
         cache: Option<&Box<dyn Any + Send + Sync>>,
-    ) -> Option<RoutingContext<NetworkMessage>> {
+    ) -> bool {
         let expr = cache
             .and_then(|i| i.downcast_ref::<String>().map(|e| e.as_str()))
             .or_else(|| ctx.full_expr());
@@ -182,21 +242,23 @@ impl InterceptorTrait for IngressMsgLogger {
             ctx.msg,
             expr,
         );
-        Some(ctx)
+        true
     }
 }
+
+#[allow(dead_code)]
 pub(crate) struct EgressMsgLogger {}
 
 impl InterceptorTrait for EgressMsgLogger {
-    fn compute_keyexpr_cache(&self, key_expr: &KeyExpr<'_>) -> Option<Box<dyn Any + Send + Sync>> {
-        Some(Box::new(key_expr.to_string()))
+    fn compute_keyexpr_cache(&self, key_expr: &keyexpr) -> Option<Box<dyn Any + Send + Sync>> {
+        Some(Box::new(OwnedKeyExpr::from(key_expr)))
     }
 
     fn intercept(
         &self,
-        ctx: RoutingContext<NetworkMessage>,
+        ctx: &mut RoutingContext<NetworkMessageMut>,
         cache: Option<&Box<dyn Any + Send + Sync>>,
-    ) -> Option<RoutingContext<NetworkMessage>> {
+    ) -> bool {
         let expr = cache
             .and_then(|i| i.downcast_ref::<String>().map(|e| e.as_str()))
             .or_else(|| ctx.full_expr());
@@ -208,10 +270,11 @@ impl InterceptorTrait for EgressMsgLogger {
             ctx.msg,
             expr
         );
-        Some(ctx)
+        true
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct LoggerInterceptor {}
 
 impl InterceptorFactoryTrait for LoggerInterceptor {
@@ -235,4 +298,22 @@ impl InterceptorFactoryTrait for LoggerInterceptor {
         tracing::debug!("New peer multicast {:?}", transport);
         Some(Box::new(IngressMsgLogger {}))
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use once_cell::sync::Lazy;
+    use zenoh_config::ZenohId;
+
+    use super::InterceptorFactory;
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) static ID_TO_INTERCEPTOR_FACTORIES: Lazy<
+        Arc<Mutex<HashMap<ZenohId, Box<dyn Fn() -> Vec<InterceptorFactory> + Sync + Send>>>>,
+    > = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 }

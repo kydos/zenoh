@@ -11,6 +11,26 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::{
+    convert::TryInto,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use tokio::task::JoinHandle;
+use zenoh_buffers::{BBuf, ZSlice, ZSliceBuffer};
+use zenoh_core::{zcondfeat, zlock};
+use zenoh_link::{LinkMulticast, Locator};
+use zenoh_protocol::{
+    core::{Bits, Priority, Resolution, WhatAmI, ZenohIdProto},
+    transport::{
+        join::ext::PatchType, BatchSize, Close, Join, PrioritySn, TransportMessage, TransportSn,
+    },
+};
+use zenoh_result::{zerror, ZResult};
+use zenoh_sync::{RecyclingObject, RecyclingObjectPool, Signal};
+
 #[cfg(feature = "stats")]
 use crate::stats::TransportStats;
 use crate::{
@@ -24,22 +44,6 @@ use crate::{
     },
     multicast::transport::TransportMulticastInner,
 };
-use std::{
-    convert::TryInto,
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::task::JoinHandle;
-use zenoh_buffers::{BBuf, ZSlice, ZSliceBuffer};
-use zenoh_core::{zcondfeat, zlock};
-use zenoh_link::{Link, LinkMulticast, Locator};
-use zenoh_protocol::{
-    core::{Bits, Priority, Resolution, WhatAmI, ZenohId},
-    transport::{BatchSize, Close, Join, PrioritySn, TransportMessage, TransportSn},
-};
-use zenoh_result::{zerror, ZResult};
-use zenoh_sync::{RecyclingObject, RecyclingObjectPool, Signal};
 
 /****************************/
 /* TRANSPORT MULTICAST LINK */
@@ -71,9 +75,7 @@ impl TransportLinkMulticast {
                     .batch
                     .is_compression
                     .then_some(BBuf::with_capacity(
-                        lz4_flex::block::get_maximum_output_size(
-                            self.config.batch.max_buffer_size()
-                        ),
+                        lz4_flex::block::get_maximum_output_size(self.config.batch.mtu as usize),
                     )),
                 None
             ),
@@ -123,18 +125,6 @@ impl fmt::Debug for TransportLinkMulticast {
             .field("link", &self.link)
             .field("config", &self.config)
             .finish()
-    }
-}
-
-impl From<&TransportLinkMulticast> for Link {
-    fn from(link: &TransportLinkMulticast) -> Self {
-        Link::from(&link.link)
-    }
-}
-
-impl From<TransportLinkMulticast> for Link {
-    fn from(link: TransportLinkMulticast) -> Self {
-        Link::from(link.link)
     }
 }
 
@@ -205,13 +195,13 @@ impl TransportLinkMulticastRx {
     pub async fn recv_batch<C, T>(&self, buff: C) -> ZResult<(RBatch, Locator)>
     where
         C: Fn() -> T + Copy,
-        T: ZSliceBuffer + 'static,
+        T: AsMut<[u8]> + ZSliceBuffer + 'static,
     {
         const ERR: &str = "Read error from link: ";
 
         let mut into = (buff)();
-        let (n, locator) = self.inner.link.read(into.as_mut_slice()).await?;
-        let buffer = ZSlice::make(Arc::new(into), 0, n).map_err(|_| zerror!("Error"))?;
+        let (n, locator) = self.inner.link.read(into.as_mut()).await?;
+        let buffer = ZSlice::new(Arc::new(into), 0, n).map_err(|_| zerror!("Error"))?;
         let mut batch = RBatch::new(self.inner.config.batch, buffer);
         batch.initialize(buff).map_err(|_| zerror!("{ERR}{self}"))?;
         Ok((batch, locator.into_owned()))
@@ -249,7 +239,7 @@ impl fmt::Debug for TransportLinkMulticastRx {
 /**************************************/
 pub(super) struct TransportLinkMulticastConfigUniversal {
     pub(super) version: u8,
-    pub(super) zid: ZenohId,
+    pub(super) zid: ZenohIdProto,
     pub(super) whatami: WhatAmI,
     pub(super) lease: Duration,
     pub(super) join_interval: Duration,
@@ -321,7 +311,10 @@ impl TransportLinkMulticastUniversal {
                 batch: self.link.config.batch,
                 queue_size: self.transport.manager.config.queue_size,
                 wait_before_drop: self.transport.manager.config.wait_before_drop,
-                backoff: self.transport.manager.config.queue_backoff,
+                wait_before_close: self.transport.manager.config.wait_before_close,
+                batching_enabled: self.transport.manager.config.batching,
+                batching_time_limit: self.transport.manager.config.queue_backoff,
+                queue_alloc: self.transport.manager.config.queue_alloc,
             };
             // The pipeline
             let (producer, consumer) = TransmissionPipeline::make(tpc, &priority_tx);
@@ -441,10 +434,10 @@ async fn tx_task(
                         link.send_batch(&mut batch).await?;
                         // Keep track of next SNs
                         if let Some(sn) = batch.codec.latest_sn.reliable {
-                            last_sns[priority].reliable = sn;
+                            last_sns[priority as usize].reliable = sn;
                         }
                         if let Some(sn) = batch.codec.latest_sn.best_effort {
-                            last_sns[priority].best_effort = sn;
+                            last_sns[priority as usize].best_effort = sn;
                         }
                         #[cfg(feature = "stats")]
                         {
@@ -491,7 +484,7 @@ async fn tx_task(
                     .collect::<Vec<PrioritySn>>();
                 let (next_sn, ext_qos) = if next_sns.len() == Priority::NUM {
                     let tmp: [PrioritySn; Priority::NUM] = next_sns.try_into().unwrap();
-                    (PrioritySn::default(), Some(Box::new(tmp)))
+                    (PrioritySn::DEFAULT, Some(Box::new(tmp)))
                 } else {
                     (next_sns[0], None)
                 };
@@ -505,6 +498,7 @@ async fn tx_task(
                     next_sn,
                     ext_qos,
                     ext_shm: None,
+                    ext_patch: PatchType::CURRENT
                 }
                 .into();
 
@@ -539,7 +533,7 @@ async fn rx_task(
     where
         T: ZSliceBuffer + 'static,
         F: Fn() -> T,
-        RecyclingObject<T>: ZSliceBuffer,
+        RecyclingObject<T>: AsMut<[u8]> + ZSliceBuffer,
     {
         let (rbatch, locator) = link
             .recv_batch(|| pool.try_take().unwrap_or_else(|| pool.alloc()))
@@ -548,10 +542,11 @@ async fn rx_task(
     }
 
     // The pool of buffers
-    let mtu = link.inner.config.batch.max_buffer_size();
+    let mtu = link.inner.config.batch.mtu as usize;
     let mut n = rx_buffer_size / mtu;
-    if rx_buffer_size % mtu != 0 {
-        n += 1;
+    if n == 0 {
+        tracing::debug!("RX configured buffer of {rx_buffer_size} bytes is too small for {link} that has an MTU of {mtu} bytes. Defaulting to {mtu} bytes for RX buffer.");
+        n = 1;
     }
 
     let pool = RecyclingObjectPool::new(n, || vec![0_u8; mtu].into_boxed_slice());
