@@ -10,4 +10,3 @@ These are the contributors to Eclipse zenoh (the initial contributors and the co
 | OlivierHecart   | Olivier Hécart (ZettaScale)      |
 | gabrik          | Gabriele Baldoni (ZettaScale)    |
 | Mallets         | Luca Cominardi (ZettaScale)      |                 
-| IvanPaez        | Ivan Paez (ZettaScale)           |            
