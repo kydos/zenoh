@@ -1,0 +1,53 @@
+{
+//  mode: "router",
+  /// The node's metadata (name, location, DNS name, etc.) Arbitrary JSON data not interpreted by zenoh and available in admin space @/<zid>/router, @/<zid>/peer or @/<zid>/client
+  metadata: {
+    name: "Zenoh Swiss Army Knife",
+    location: "My Laptop",
+  },
+  listen: {
+    endpoints: {
+      router: ["tcp/127.0.0.1:7447"],
+    }
+  },
+  timestamping: {
+    enabled: { router: true, peer: true, client: false },
+    drop_future_timestamp: false,
+  },
+
+  /// Configure the Admin Space
+  /// Unstable: this configuration part works as advertised, but may change in a future release
+  adminspace: {
+    /// Enables the admin space
+    enabled: true,
+    /// read and/or write permissions on the admin space
+    permissions: {
+      read: true,
+      write: true,
+    },
+  },
+  ///
+  /// Plugins configurations
+  ///
+  //
+  plugins_loading: {
+    enabled: true,
+  },
+  plugins: {
+    rest: {
+      __required__: true,
+      http_port: 9009,
+      work_thread_num: 2,
+      max_block_thread_num: 50,
+    },
+//    storage_manager: {
+//      __required__: true,
+//      storages: {
+//        demo: {
+//          key_expr: "**",
+//          volume: "memory",
+//        }
+//      }
+//    }
+  }
+}
