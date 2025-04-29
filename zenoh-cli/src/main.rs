@@ -114,12 +114,13 @@ async fn main() {
             let zid = z.zid().to_string();
             let zask = format!("@/{}/{}/config/plugins/storage_manager/storages/zenoh-storage",  &zid, &mode);
 
+            let complete = *sub_matches.get_one::<bool>("complete").unwrap();
             let kexpr = sub_matches.get_one::<String>("KEY_EXPR").unwrap();
             let replication = if sub_matches.get_one::<bool>("align").is_some() {
                 r#", replication: { interval: 3, sub_intervals: 5, hot: 6, warm: 24, propagation_delay: 10}"#
             } else { "" };
-            let storage_cfg = format!("{{ key_expr: \"{}\", volume: \"memory\",  complete: \"true\" {}, }}", kexpr, replication);
-            println!("{}: {}", zask, storage_cfg);
+            let storage_cfg = format!("{{ key_expr: \"{}\", volume: \"memory\",  complete: \"{}\" {}, }}", kexpr, complete, replication);
+            // println!("{}: {}", zask, storage_cfg);
             z.put(zask, storage_cfg).await.unwrap();
             true
         },

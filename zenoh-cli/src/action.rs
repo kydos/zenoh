@@ -88,7 +88,7 @@ pub async fn do_publish(z: &zenoh::Session, sub_matches: &ArgMatches) {
             println!("[{}]", i);
         }
         if period != 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(period)).await;
+            tokio::time::sleep(Duration::from_millis(period)).await;
         }
     }
 }
@@ -103,7 +103,7 @@ pub async fn do_subscribe(z: &zenoh::Session, sub_matches: &ArgMatches) {
     while let Ok(sample) = s.recv_async().await {
         n += 1;
         println!("{}({}):", "Sample".bold(), n);
-        if sample.encoding().type_id() == zenoh::bytes::Encoding::ZENOH_STRING.type_id() {
+        if sample.encoding().type_id() == Encoding::ZENOH_STRING.type_id() {
             if let Some(attch) = sample.attachment() {
                 let str = attch.try_to_string().unwrap_or(Cow::from("[..]"));
 
@@ -154,7 +154,6 @@ pub(crate) async fn do_query(z: &zenoh::Session, sub_matches: &ArgMatches) {
             QueryTarget::BestMatching
         }
     };
-    println!("Query target: {:?}", target);
 
     let consolidation =
         match resolve_optional_argument::<String>(sub_matches, "consolidation", false)
@@ -265,7 +264,6 @@ pub(crate) async fn do_queryable(z: &zenoh::Session, sub_matches: &ArgMatches) {
             use pyo3::prelude::*;
             use pyo3::types::PyDict;
             use std::ffi::CString;
-
             pyo3::prepare_freethreaded_python();
             let result = pyo3::prelude::Python::with_gil(|py| {
                 let locals = PyDict::new(py);
