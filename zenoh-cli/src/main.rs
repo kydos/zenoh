@@ -23,7 +23,7 @@ async fn main() {
         }
     };
 
-    match matches.get_one::<String>("mode") {
+    let mode = match matches.get_one::<String>("mode") {
         Some(m) => {
             match m.as_str() {
                 "peer" => {},
@@ -36,11 +36,19 @@ async fn main() {
 
             }
             config.insert_json5("mode", &format!("\"{}\"",m)).unwrap();
+            (*m).clone()
         },
-        None => {}
+        None => {String::from("peer")}
     };
 
     set_required_options(&mut config);
+
+    match matches.get_one::<String>("name") {
+        Some(m) => {
+            config.insert_json5("metadata", &format!("{{ name: \"{}\" }}",m)).unwrap();
+        },
+        None => {}
+    };
 
     match matches.get_one::<bool>("disable_scouting") {
         Some(disabled) => {
@@ -104,12 +112,14 @@ async fn main() {
         },
         Some(("storage", sub_matches)) => {
             let zid = z.zid().to_string();
-            let zask = format!("@/{}/peer/config/plugins/storage_manager/storages/zenoh-storage", &zid);
+            let zask = format!("@/{}/{}/config/plugins/storage_manager/storages/zenoh-storage",  &zid, &mode);
+
             let kexpr = sub_matches.get_one::<String>("KEY_EXPR").unwrap();
             let replication = if sub_matches.get_one::<bool>("align").is_some() {
                 r#", replication: { interval: 3, sub_intervals: 5, hot: 6, warm: 24, propagation_delay: 10}"#
             } else { "" };
-            let storage_cfg = format!("{{ key_expr: \"{}\", volume: \"memory\" {} }}", kexpr, replication);
+            let storage_cfg = format!("{{ key_expr: \"{}\", volume: \"memory\",  complete: \"true\" {}, }}", kexpr, replication);
+            println!("{}: {}", zask, storage_cfg);
             z.put(zask, storage_cfg).await.unwrap();
             true
         },
