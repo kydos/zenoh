@@ -232,12 +232,12 @@ pub(crate) async fn do_query(z: &zenoh::Session, sub_matches: &ArgMatches) {
                 println!("\t{}: {}", "Source Id".bold(), sid);
                 println!("\t{}: {}", "Source SN".bold(), ssn);
                 println!("\t{}: {}", "Key".bold(), result.key_expr());
+                println!("\t{}: {}", "Timestamp".bold(), result.timestamp().map(|ts| {ts.to_string()}).unwrap_or_else(|| "None".into()));
                 println!(
                     "\t{}: {}",
                     "Value".bold(),
                     result.payload().try_to_string().unwrap()
                 );
-                println!("\t{}: {}", "Timestamp".bold(), result.timestamp().map(|ts| {ts.to_string()}).unwrap_or_else(|| "None".into()));
             }
             Err(e) => {
                 println!("\t{}: {}", "Result".bold(), e);
@@ -249,33 +249,42 @@ pub(crate) async fn do_query(z: &zenoh::Session, sub_matches: &ArgMatches) {
 pub(crate) async fn do_queryable(z: &zenoh::Session, sub_matches: &ArgMatches) {
     let complete = resolve_bool_argument(sub_matches, "complete");
     let exec_script = resolve_bool_argument(sub_matches, "script");
+    let site_packages =
+        if let Some(path) = resolve_optional_argument::<String>(
+            sub_matches, "packages", false).await.unwrap() {
+            format!("import sys\nsys.path.append('{}')\n", path)
+        } else { String::default()};
+
     let file_based = resolve_bool_argument(sub_matches, "file");
     let kexpr: String = resolve_argument(sub_matches, "KEY_EXPR", false).await.unwrap();
     let reply: String = resolve_argument(sub_matches, "REPLY", file_based).await.unwrap();
+
 
     let queryable =
         z.declare_queryable(kexpr.clone()).complete(complete).await.expect("Unable to declare queryable");
 
     let mut n = 0;
     let si = SourceInfo::new(Some(queryable.id()), Some(0));
+    println!("\tQueryable Running!");
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use std::ffi::CString;
+    pyo3::prepare_freethreaded_python();
     while let Ok(query) = queryable.recv_async().await {
         n += 1;
         println!("{}({}):", "Query".bold(), n);
         println!("\t{}: {}", "Key Expr".bold(), query.key_expr());
         if exec_script {
-            use pyo3::prelude::*;
-            use pyo3::types::PyDict;
-            use std::ffi::CString;
-            pyo3::prepare_freethreaded_python();
             let result = pyo3::prelude::Python::with_gil(|py| {
                 let locals = PyDict::new(py);
                 let key_expr = query.key_expr().to_string();
                 let payload = query.payload().map(|p| { p.to_bytes().to_vec() }).unwrap_or_else(Vec::new);
                 locals.set_item("key_expr", key_expr).unwrap();
                 locals.set_item("payload", payload).unwrap();
-                let script = CString::new(reply.as_str()).unwrap();
-                let result: String = py.eval(script.as_c_str(), None, Some(&locals)).unwrap().extract().unwrap();
-                result
+
+                let script = CString::new(site_packages.clone() + reply.as_str()).unwrap();
+                py.run(script.as_c_str(), None, Some(&locals)).unwrap();
+                locals.get_item("result").unwrap().unwrap().extract::<String>().unwrap()
             });
 
             query.reply(query.key_expr(), &result)

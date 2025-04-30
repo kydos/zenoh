@@ -92,6 +92,7 @@ pub(crate) fn arg_parser() -> Command {
                 .arg(arg!(-c --complete "Makes the queriable complete").required(false))
                 .arg(arg!(-f --file "If enabled expects that the replt is a file name").required(false))
                 .arg(arg!(-s --script "the <REPLY> is a python script").required(false))
+                .arg(arg!(-p --packages <PATH> "The path to the python site-packages including required dependencies").required(false))
                 .arg(arg!(<KEY_EXPR> "The expression associated with the queryable"))
                 .arg(arg!(<REPLY> "The reply used by the queryable"))
                 .after_help(QUERYABLE_AFTER_HELP)

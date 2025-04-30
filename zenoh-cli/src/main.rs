@@ -84,8 +84,9 @@ fn parse_top_level_args(config: &mut zenoh::config::Config, matches: &ArgMatches
         config.insert_json5("metadata", &format!("{{ name: \"{}\" }}",m)).unwrap();
     }
 
-    if let Some(scouting) =  matches.get_one::<bool>("disable_scouting") {
-        if !scouting {
+    if let Some(ds) =  matches.get_one::<bool>("disable_scouting") {
+        if *ds {
+            println!("Scouting disabled");
             config.insert_json5("scouting/multicast/enabled", "false").unwrap();
         }
     }
