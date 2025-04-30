@@ -270,7 +270,7 @@ pub(crate) async fn do_queryable(z: &zenoh::Session, sub_matches: &ArgMatches) {
             let result = pyo3::prelude::Python::with_gil(|py| {
                 let locals = PyDict::new(py);
                 let key_expr = query.key_expr().to_string();
-                let payload = query.payload().map(|p| { p.to_bytes().to_vec() }).unwrap_or_else(|| vec![]);
+                let payload = query.payload().map(|p| { p.to_bytes().to_vec() }).unwrap_or_else(Vec::new);
                 locals.set_item("key_expr", key_expr).unwrap();
                 locals.set_item("payload", payload).unwrap();
                 let script = CString::new(reply.as_str()).unwrap();

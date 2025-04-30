@@ -1,14 +1,9 @@
+use clap::ArgMatches;
 
 mod action;
 mod parser;
 
 
-fn set_required_options(config: &mut zenoh::config::Config) {
-    config.insert_json5("plugins_loading/enabled", "true").unwrap();
-    config.insert_json5("plugins/storage_manager/__required__","true").unwrap();
-    config.insert_json5("metadata", r#"{ name: "Zenoh Swiss Army Knife", location: "My Laptop" }"#).unwrap();
-    config.insert_json5("timestamping", r#"{ enabled: { router: true, peer: true, client: true }, drop_future_timestamp: false }"#).unwrap();
-}
 
 #[tokio::main]
 async fn main() {
@@ -23,65 +18,8 @@ async fn main() {
         }
     };
 
-    let mode = match matches.get_one::<String>("mode") {
-        Some(m) => {
-            match m.as_str() {
-                "peer" => {},
-                "client" => {},
-                "router" => {},
-                _ => {
-                    println!("Invalid mode: {}", m);
-                    return;
-                }
-
-            }
-            config.insert_json5("mode", &format!("\"{}\"",m)).unwrap();
-            (*m).clone()
-        },
-        None => {String::from("peer")}
-    };
-
     set_required_options(&mut config);
-
-    match matches.get_one::<String>("name") {
-        Some(m) => {
-            config.insert_json5("metadata", &format!("{{ name: \"{}\" }}",m)).unwrap();
-        },
-        None => {}
-    };
-
-    match matches.get_one::<bool>("disable_scouting") {
-        Some(disabled) => {
-            if *disabled {
-                config.insert_json5("scouting/multicast/enabled", "false").unwrap();
-            }
-        }, None => {}
-    };
-
-    match matches.get_one::<String>("endpoints") {
-        Some(es) => {
-            config.insert_json5("connect/endpoints", es).unwrap();
-        },
-        None => {}
-    };
-
-
-
-    match matches.get_one::<String>("rest") {
-        Some(port) => {
-            config.insert_json5(
-                "plugins/rest",
-                &format!("{{http_port: {} }}", port)).unwrap();
-        },
-        None => {}
-    }
-    match matches.get_one::<bool>("admin") {
-        Some(_) => {
-            config.insert_json5("adminspace/enabled", "true").unwrap();
-            config.insert_json5("adminspace/permissions", "{ read: true, write: true }").unwrap();
-        },
-        None => {}
-    }
+    let mode = parse_top_level_args(&mut config, &matches);
 
     let z = zenoh::open(config.clone())
         .await
@@ -116,11 +54,11 @@ async fn main() {
 
             let complete = *sub_matches.get_one::<bool>("complete").unwrap();
             let kexpr = sub_matches.get_one::<String>("KEY_EXPR").unwrap();
+            // @TODO: Eventually we should add additional params to configure the alignement algo.
             let replication = if sub_matches.get_one::<bool>("align").is_some() {
                 r#", replication: { interval: 3, sub_intervals: 5, hot: 6, warm: 24, propagation_delay: 10}"#
             } else { "" };
             let storage_cfg = format!("{{ key_expr: \"{}\", volume: \"memory\",  complete: \"{}\" {}, }}", kexpr, complete, replication);
-            // println!("{}: {}", zask, storage_cfg);
             z.put(zask, storage_cfg).await.unwrap();
             true
         },
@@ -131,4 +69,61 @@ async fn main() {
         tokio::signal::ctrl_c().await.unwrap();
     }
 
+}
+
+// --- Arg Parsing and Config Updating functions
+fn set_required_options(config: &mut zenoh::config::Config) {
+    config.insert_json5("plugins_loading/enabled", "true").unwrap();
+    config.insert_json5("plugins/storage_manager/__required__","true").unwrap();
+    config.insert_json5("metadata", r#"{ name: "Zenoh Swiss Army Knife", location: "My Laptop" }"#).unwrap();
+    config.insert_json5("timestamping", r#"{ enabled: { router: true, peer: true, client: true }, drop_future_timestamp: false }"#).unwrap();
+}
+
+fn parse_top_level_args(config: &mut zenoh::config::Config, matches: &ArgMatches) -> String {
+    if let Some(m) = matches.get_one::<String>("name") {
+        config.insert_json5("metadata", &format!("{{ name: \"{}\" }}",m)).unwrap();
+    }
+
+    if let Some(scouting) =  matches.get_one::<bool>("disable_scouting") {
+        if !scouting {
+            config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+        }
+    }
+
+    if let Some(es) = matches.get_one::<String>("endpoints") {
+        config.insert_json5("connect/endpoints", es).unwrap();
+    }
+
+    if let Some(port) = matches.get_one::<String>("rest") {
+        config.insert_json5(
+            "plugins/rest",
+            &format!("{{http_port: {} }}", port)).unwrap();
+    }
+
+    if let Some(admin) = matches.get_one::<bool>("admin") {
+        if *admin {
+            config.insert_json5("adminspace/enabled", "true").unwrap();
+            config.insert_json5("adminspace/permissions", "{ read: true, write: true }").unwrap();
+        }
+    }
+
+    let mode = match matches.get_one::<String>("mode") {
+        Some(m) => {
+            let mode = match m.as_str() {
+                "peer" => {"peer"},
+                "client" => { "client" },
+                "router" => { "router" },
+                _ => {
+                    println!("Invalid mode \"{}\" defaulting to \"peer\"", m);
+                    "peer"
+                }
+
+            };
+            config.insert_json5("mode", &format!("\"{}\"",mode)).unwrap();
+            mode
+        },
+        None => { "peer" }
+    };
+
+    mode.into()
 }
