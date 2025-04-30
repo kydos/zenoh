@@ -8,6 +8,7 @@ use std::time::Duration;
 use zenoh::bytes::Encoding;
 use zenoh::config::WhatAmI;
 use zenoh::query::{ConsolidationMode, QueryTarget};
+use zenoh::sample::SourceInfo;
 use zenoh::session::ZenohId;
 
 pub async fn do_scout(z: &zenoh::Session, sub_matches: &ArgMatches) {
@@ -222,14 +223,14 @@ pub(crate) async fn do_query(z: &zenoh::Session, sub_matches: &ArgMatches) {
 
         match reply.result() {
             Ok(result) => {
-                // let sid = if let Some(sid) = result.source_info().source_id() {
-                //     sid.zid().to_string()
-                // } else {
-                //     "Unknown".into()
-                // };
-                // let ssn = result.source_info().source_sn().unwrap_or_default();
-                // println!("\t{}: {}", "Source Id".bold(), sid);
-                // println!("\t{}: {}", "Source SN".bold(), ssn);
+                let sid = if let Some(sid) = result.source_info().source_id() {
+                    sid.zid().to_string()
+                } else {
+                    "Unknown".into()
+                };
+                let ssn = result.source_info().source_sn().unwrap_or_default();
+                println!("\t{}: {}", "Source Id".bold(), sid);
+                println!("\t{}: {}", "Source SN".bold(), ssn);
                 println!("\t{}: {}", "Key".bold(), result.key_expr());
                 println!(
                     "\t{}: {}",
@@ -256,6 +257,7 @@ pub(crate) async fn do_queryable(z: &zenoh::Session, sub_matches: &ArgMatches) {
         z.declare_queryable(kexpr.clone()).complete(complete).await.expect("Unable to declare queryable");
 
     let mut n = 0;
+    let si = SourceInfo::new(Some(queryable.id()), Some(0));
     while let Ok(query) = queryable.recv_async().await {
         n += 1;
         println!("{}({}):", "Query".bold(), n);
@@ -275,10 +277,17 @@ pub(crate) async fn do_queryable(z: &zenoh::Session, sub_matches: &ArgMatches) {
                 let result: String = py.eval(script.as_c_str(), None, Some(&locals)).unwrap().extract().unwrap();
                 result
             });
-            query.reply(query.key_expr(), &result).await.unwrap();
+
+            query.reply(query.key_expr(), &result)
+                .source_info(si.clone())
+                .timestamp(z.new_timestamp())
+                .await.unwrap();
         }
         else {
-            query.reply(query.key_expr(), &reply).await.unwrap();
+            query.reply(query.key_expr(), &reply)
+                .source_info(si.clone())
+                .timestamp(z.new_timestamp())
+                .await.unwrap();
         }
     }
 }
